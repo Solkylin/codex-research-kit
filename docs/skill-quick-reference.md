@@ -30,3 +30,7 @@
 3. Call or execute the selected tool; a skill name or cached plugin is not evidence of execution.
 4. Check the result at the level that matters: source, calculation, rendered artifact or live behavior.
 5. Keep process records outside formal deliverables.
+
+## Bundled research methods
+
+The public package also bundles the licensed research-method collection listed in `manifest.json`: literature lookup and review, scientific writing and critical thinking, exploratory analysis, statistics, PyMC/pymoo/scikit-learn, SymPy, Matplotlib/Seaborn, Polars/NetworkX/SimPy and related helpers. Use the narrowest matching skill after the main flow determines the object and completion criteria.
