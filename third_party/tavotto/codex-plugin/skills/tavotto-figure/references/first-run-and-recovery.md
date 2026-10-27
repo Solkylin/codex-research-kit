@@ -1,0 +1,149 @@
+# 首次使用与恢复（只在会话入口判到异常时读）
+
+本文件展开 SKILL.md「会话入口」各状态的恢复动作。**健康会话一个字都不用读。**
+
+下面的安装命令是 **Codex** 的。用户在别的宿主里（Cursor、Claude、VS Code、Trae、DSH、
+WorkBuddy、ZCode……）时，安装和重载看 `other-hosts.md`；引擎侧的恢复（provision、错误码）两边一样。
+
+## 插件没有在本会话加载（工具列表里没有 `tavotto_health`）
+
+说明插件不在本会话里。给用户 README「在 Codex 中第一次使用 Tavotto」的两条
+安装命令（分开跑，别用 `&&`——不同 shell 兼容，也好判断是哪一步失败）：
+
+```sh
+codex plugin marketplace add Tavotto/Tavotto --sparse .agents/plugins
+codex plugin add tavotto@tavotto
+```
+
+市场清单指向发行分支 `plugin-stable`（`git-subdir` 来源）：装到的是 CI 构建并验证过的
+完整插件（含内嵌画布），不需要 Node，也不从源码 checkout 里取任何东西。老版本的
+Codex 不认识这种来源时，`codex plugin list` 里不会出现 `tavotto`——让用户升级 Codex。
+
+然后**要求用户新开一个 Codex 会话，并停止当前任务**。已经开着的会话不会
+重新加载插件的 skill 与 MCP 工具；`codex plugin list` 显示 enabled 也不代表
+当前会话拿得到工具。**不要在旧会话里继续假装工具可用**，也不要替用户在本会话
+里重装第二遍。
+
+### 插件明明装着、也新开过会话，工具还是一个都没有（多见于 Windows）
+
+这时候**不是插件没装**，是 Codex 起 MCP server 的那一跳没起来。插件的启动命令是
+自带的 `./mcp/launch`（Windows 上实际跑的是同目录的 `launch.cmd`），它会自己找一个能跑的 Python（Windows 上会跳过微软商店的
+App Execution Alias——命令**存在**、启动起来只有一个 9009 且什么都不打印）；还是一个
+工具都没有，说明这台机器上它一个能跑的 Python 都没找到，连会说人话的降级 server 都
+起不来，Codex 那边也不会为此报任何错。
+
+给用户这两条里的一条（**不要重装插件、不要 marketplace upgrade**）：
+
+```sh
+tavotto codex doctor      # 只诊断：指名道姓说出是哪条启动命令起不来
+tavotto codex install     # 修：把已装副本的启动命令钉到一个验证过的解释器
+```
+
+跑完**新开一次 Codex 会话**。用户只装了桌面版、PATH 上没有 `tavotto` 时，用桌面
+版自带的 `tavotto-cli` 跑同样的子命令。
+
+## 工具在、引擎不可用（`tavotto_health` 回 `ok: false`）
+
+按返回的 `code` 只做**对应的一条**恢复动作，不做全套重装：
+
+* `desktop_only` —— 用户装了 Tavotto 桌面版，**不要说「没有安装 Tavotto」**。
+  桌面交接（`scripts/handoff.py`）此刻就能用。只有用户明确要 Codex 内嵌画布 /
+  MCP 工具时，才给这两条里的一条（不是都给）：
+
+  ```sh
+  python3 <插件目录>/mcp/server.py --provision      # 插件自管 venv，零手工配置
+  pipx install "tavotto[worker]"                     # 或者装 pip 形态的引擎
+  ```
+
+  装完**新开会话**才拿得到工具。`--provision` 自己会挑一个 Python 3.10–3.14 建环境
+  （跑它的 `python3` 老一点没关系）；它回 `no_supported_python` 时机器上确实没有这个
+  区间的 Python——把它 `error` 里逐个列出的版本和 `recovery` 转达给用户（装一个再重跑，
+  或 `--python <路径>` 指定），**不要**把它读成「这一版 tavotto 还没发」，也不要在
+  老 Python 上手动 `pip install`。
+* `engine_too_old` / `engine_incompatible` —— 机器上**装着** pip / pipx 形态的引擎，只是
+  插件驱动不了它：`engine_too_old` 是版本低于插件要求的下限（`engine_version` 与
+  `min_tavotto_version` 两个版本号都在结果里）；`engine_incompatible` 是说不出下限（插件没带
+  构建清单）或版本够了却 import 不全（装残了）。**不要说「只装了桌面版」，也不要给
+  `--provision`**（那只会在旁边再建一个环境，原来那个照样旧）。把 `error` / `recovery` 里的
+  升级命令原样转达，形如：
+
+  ```sh
+  pipx upgrade tavotto
+  pipx install --force "tavotto[worker]==<要求的版本>"
+  ```
+
+  结果里的 `pip_index.mirror` 为真时，pip 指向镜像，镜像可能还没同步到新版，照常升级只会
+  再装回旧版——这时 `recovery` 里的命令都带着 `--index-url https://pypi.org/simple`，照抄它，
+  别自己换回不带它的写法。装完**新开会话**。
+* `tavotto_missing` —— 机器上确实没有 Tavotto。按用户的需求引导：只要桌面收尾
+  就装桌面版（<https://github.com/Tavotto/Tavotto/releases>），要 Codex 内嵌
+  工具就 `pipx install "tavotto[worker]"`。
+* `managed_runtime_stale` —— 插件自管环境还是旧版引擎（插件升级后最常见）。
+  启动器**已经在后台**把它重装到插件对应的版本（`auto_provision.started`；日志在
+  `auto_provision.log`），告诉用户等一两分钟后**新开会话**即可，不要让他重装插件或
+  装 pipx。`auto_provision.started` 为 false 且原因不是 `already_running` 时（离线、
+  被 `TAVOTTO_MCP_NO_AUTO_PROVISION=1` 关掉），才给手动那条
+  `python3 <插件目录>/mcp/server.py --provision`。
+* `engine_unavailable`（`TAVOTTO_MCP_PYTHON` 指错了）—— 指名道姓地把它报给
+  用户，让用户改环境变量或去掉；不要悄悄换别的解释器。
+* 其它 code —— 把 `code` + health 输出里的 `recovery` 步骤原样转达。
+
+**引擎缺失只修引擎**：插件已经加载了，绝不因为引擎不可用而重装插件或
+marketplace add/upgrade。
+
+## 插件有新版本（`update.status == "available"`）
+
+当前任务照常做完。收尾时提醒**一次**：
+
+```sh
+codex plugin marketplace upgrade tavotto
+```
+
+升级后同样要新开会话。升级会把插件目录整个换掉，之前 `tavotto codex install` 钉进
+已装副本的解释器绝对路径会被换回自带的 `./mcp/launch`——它自己找 Python，多数
+机器上不用再做什么；**Windows 上升级后若又一个工具都没有，再跑一次
+`tavotto codex install`**。若这条命令报 `not configured as a Git marketplace`：这台机器
+没有 git，插件是 `tavotto codex install` 从发行分支压缩包装成本地市场的，改为提醒
+`tavotto codex upgrade`（它重新下载、核对、让 Codex 重装）。
+不自动升级、不反复提醒、不为此打断手里的活。`update`
+里若还有 `tavotto` 字段，那是说本机 Tavotto 版本低于新插件的要求——让用户去
+Releases 更新 Tavotto（**跟插件是两码事，别混着说**）。
+
+## 离线 / 网络失败
+
+安装、升级、marketplace 都是尽力而为：失败就报一句，**不循环重试，不退回
+clone 源码或本地构建**。已经画好的图和脚本都在磁盘上，联网恢复后重跑同一条
+命令即可。
+
+## 工作区授权（每个连接第一次 open 时）
+
+看 `tavotto_health` 的 `root_authority`。`roots` 为空且 client 声明了
+`elicitation` 时：第一次 `tavotto_open_figure` 必须传**绝对、已存在**的项目
+路径，让 Codex 显示规范路径请用户确认——模型给的路径只是候选，不能自证权限。
+授权失败**分档**，每档一个稳定 `code`、一个 `disposition`（谁该动手）和一句
+`recovery`（下一步）。**把 `recovery` 转达给用户，别把 `code` 念出来**；不要
+自动重试，也不要改用 shell 绕过。health 已给出恰好一个可信根时才可以用相对路径。
+
+| `code` | `disposition` | 下一步 |
+| --- | --- | --- |
+| `workspace_confirmation_declined` | `ask_user_again` | 用户看着框拒绝了：换个目录再问一次 |
+| `workspace_confirmation_cancelled` | `ask_user_again` | 框被关掉：可交互会话里请用户重新发起；`codex exec` 拿不到确认 |
+| `workspace_confirmation_no_response` | `fix_host_wiring` | **框从没到过用户面前**（超时/断开）：查宿主接线，别再让用户点 |
+| `workspace_confirmation_auto_declined` | `fix_host_wiring` | **宿主当场替用户回了拒绝**（Codex「完全访问」/ `codex exec`）：请用户把权限切到「请求批准」再开，别再让用户点 |
+| `workspace_confirmation_error` | `fix_host_wiring` | 宿主回了错误：看宿主日志 |
+| `workspace_confirmation_stale` | `ask_user_again` | 批准的目录在授权落地前变了：核对路径后重新批准 |
+| `workspace_confirmation_required` | `send_absolute_path` | 还没给出可展示的目录：改传绝对、已存在的路径 |
+| `workspace_roots_no_response` / `workspace_roots_error` | `fix_host_wiring` | 宿主声明了 roots 却没给出目录：查宿主接线 |
+| `path_out_of_scope` | `narrow_the_path` | 路径越界：改用 `roots` 里列出的目录 |
+| `no_workspace_root` | `configure_roots` | 宿主什么都没给：让用户设 `TAVOTTO_MCP_ROOTS` 后重启 |
+| `workspace_root_too_broad` | `configure_roots` | 给出的目录是整个用户主目录（或它的上级）：请用户在具体项目目录里启动宿主，或把 `TAVOTTO_MCP_ROOTS` 设成项目目录后重启 |
+
+**`fix_host_wiring` 那几档不是用户拒绝**：再让用户点多少次都不会有提示，只能
+去查宿主，或退回 `TAVOTTO_MCP_ROOTS`。这两件事的处置相反，别混着说。
+
+## 三条铁律
+
+* 引擎不可用 ≠ 可以拿桌面窗口或浏览器顶替内嵌画布——那是两条路，不许冒充；
+* 插件 enabled ≠ 工具可用：装完插件/引擎必须**新开会话**；
+* 工具回了结构化错误就把 `code` + 恢复步骤转达给用户，绝不自己编一个成功。
+

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Docling 文献结构提取"
+  short_description: "提取复杂文献的章节、表格和图注，按需使用 Docling 并回查原页"
+  default_prompt: "使用 $docling，按当前任务提取文献结构与关键内容，选择必要格式并核对原页。"
+policy:
+  allow_implicit_invocation: false
+

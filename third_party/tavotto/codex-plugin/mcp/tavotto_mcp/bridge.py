@@ -1,0 +1,2775 @@
+"""MCP 工具与 Tavotto 引擎之间的那一层 —— **只翻译，不实现**。
+
+会话、manifest、override 语义、patch 规范化、导出全部落回
+`tavotto.engine.{pool,registry,handoff,patchspec,profiles,preflight}`。
+本模块负责的只有三件事：
+
+1. **路径范围校验**：Codex 会把任意路径喂进来，越界的一律拒；
+2. **会话账本**：session_id ↔ (项目, stem, worker)；
+3. **响应形状**：把引擎的返回整理成 Codex 读得懂的 JSON。
+
+不变式与 Tavotto 本体完全一致（`docs/adr/0003-worker-protocol-v1.md`）：
+
+    hot_apply(canonical_patches)
+      == fresh_worker_replay(canonical_patches)
+      == writeback_then_reopen(canonical_patches)
+
+之所以成立，是因为这里发给 worker 的 patches 与 Flask 发的是同一条路径
+（`pool.EngineWorker.override` / `.export`），**没有第二套应用逻辑**。
+
+纯标准库 + tavotto 本体。
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import quote
+
+from tavotto.engine import (
+    artifactcheck as engine_artifactcheck,
+    artifactinspect as engine_artifactinspect,
+    config as engine_config,
+    exportjob as engine_exportjob,
+    exportreq as engine_exportreq,
+    figcapture as engine_figcapture,
+    handoff as engine_handoff,
+    interference as engine_interference,
+    normalize as engine_normalize,
+    patchspec,
+    pool as engine_pool,
+    preflight as engine_preflight,
+    previewbudget,
+    profiles as engine_profiles,
+    profilestore as engine_profilestore,
+    project_refresh as engine_refresh,
+    readiness as engine_readiness,
+    registry as engine_registry,
+    telemetry as engine_telemetry,
+    workdir as engine_workdir,
+)
+
+from . import sessionjournal
+from .roots import (
+    CODE_AMBIGUOUS_ROOT,
+    CODE_NO_WORKSPACE_ROOT,
+    CODE_PATH_OUT_OF_SCOPE,
+    CODE_ROOT_TOO_BROAD,
+    CODE_ROOTS_ERROR,
+    CODE_ROOTS_NO_RESPONSE,
+    ROOTS_ENV,
+    WORKSPACE_ENVS,
+    WORKSPACE_FAILURES,
+    RootAuthority,
+    canonical_path,
+)
+
+# 这些负载只在完整渲染响应与按需快照里返回；摘要与诊断账本共用这一份字段表。
+RENDER_PAYLOAD_KEYS = ("manifest", "svg", "preview_png_base64", "preview_png_manifest")
+# 额外保留的 apply 诊断按紧凑 UTF-8 JSON 限额；warnings / preview 已在 Session，不再保存。
+APPLY_RECEIPT_BUDGET_BYTES = 64 * 1024
+APPLY_RECEIPT_KEYS = (
+    "ok",
+    "session_id",
+    "stem",
+    "restored",
+    "applied",
+    "rejected",
+    "canonical_patch_count",
+    "contract_released",
+    "patch_hash",
+    "worker_generation",
+    "render_revision",
+    "timings",
+    "preview_png_error",
+)
+
+#: 工作区提示：装好的插件里 Codex MCP 配置（`codex.mcp.json`）的 `cwd` 指向**插件自己的目录**
+#: （`./mcp/server.py` 要靠它解析），于是「不给就用进程 cwd」在真实安装下
+#: 等于把用户工作区里的每一张图都判成 `path_out_of_scope`——默认流程根本
+#: 跑不起来。所以 cwd 只在它**不是插件目录**时才算数（源码树里直接跑
+#: `python codex-plugin/mcp/server.py` 的开发态就是这一格），否则退回宿主
+#: 传过来的工作区变量。一个都拿不到时**报错说清楚要设什么**，绝不就近
+#: 挑一个目录顶上。
+#: 插件包自己所在的目录（`codex-plugin/`）——cwd 落在它里面就说明这是
+#: Codex 用来定位 `./mcp/server.py` 的那个 cwd，不是用户的工作区。
+_PLUGIN_DIR = canonical_path(os.path.join(os.path.dirname(__file__), "..", ".."))
+_ROOT_AUTHORITY = RootAuthority(_PLUGIN_DIR)
+#: 会话上限：一个 Codex 会话同时端着几十张图没有意义，而每个 worker 都是一个
+#: 常驻 Python 进程（几百 MB）。超了按最久未用淘汰。
+MAX_SESSIONS = 8
+#: 导出格式白名单。**取自唯一那份枚举**（`engine/exportreq.ENGINE_FORMATS`）：
+#: 引擎直接序列化这条路比画布合成多认一个 svg，而"认哪几种"这件事只该有一处
+#: 说了算——两处各写一份，迟早有一处漏掉新格式而另一处放行。
+EXPORT_FORMATS = engine_exportreq.ENGINE_FORMATS
+
+
+class BridgeError(RuntimeError):
+    """带机器可读 code 的失败。工具层转成 `isError` 结果，绝不吞。"""
+
+    def __init__(self, message: str, code: str = "bridge_error", **extra) -> None:
+        super().__init__(message)
+        self.code = code
+        self.extra = extra
+
+    def payload(self) -> dict:
+        return {"ok": False, "code": self.code, "error": str(self), **self.extra}
+
+
+# ----------------------------- 路径范围校验 ---------------------------------
+def allowed_roots() -> list[str]:
+    return list(_ROOT_AUTHORITY.snapshot().roots)
+
+
+def root_diagnostics() -> dict:
+    return _ROOT_AUTHORITY.diagnostics()
+
+
+def observe_mcp_client(protocol_version: str | None, capabilities, client_info) -> None:
+    _ROOT_AUTHORITY.observe_client(protocol_version, capabilities, client_info)
+
+
+def protocol_roots_needed() -> bool:
+    return _ROOT_AUTHORITY.protocol_request_needed()
+
+
+def user_binding_candidate(target) -> str | None:
+    return _ROOT_AUTHORITY.user_binding_candidate(target)
+
+
+def accept_user_binding(candidate: str) -> bool:
+    return _ROOT_AUTHORITY.accept_user_binding(candidate)
+
+
+def fail_user_binding(message: str, *, state: str = "error") -> None:
+    _ROOT_AUTHORITY.fail_user_binding(message, state=state)
+
+
+def workspace_failure():
+    return _ROOT_AUTHORITY.failure()
+
+
+def accept_protocol_roots(result) -> None:
+    _ROOT_AUTHORITY.accept_protocol_result(result)
+
+
+def fail_protocol_roots(message: str, *, state: str = "error") -> None:
+    _ROOT_AUTHORITY.fail_protocol(message, state=state)
+
+
+def mark_protocol_roots_stale() -> None:
+    _ROOT_AUTHORITY.mark_protocol_stale()
+
+
+def reset_root_authority() -> None:
+    _ROOT_AUTHORITY.reset()
+
+
+def _no_roots_error() -> "BridgeError":
+    """一个可用的根都没有时说人话——**并且说清是哪一档**。
+
+    静默放行等于没有边界，静默拒绝等于「装了插件但什么都打不开」且毫无线索。
+    但把失败并成一档同样不行（issue #173）：宿主声明了 elicitation 却没弹框，
+    与用户看着框按了拒绝，处置正好相反。分档与措辞的唯一出处是
+    `roots.WORKSPACE_FAILURES`，这里只负责把当时的细节接上去。
+    """
+    diagnostics = root_diagnostics()
+    confirmation = diagnostics.get("workspace_confirmation") or {}
+    failure = workspace_failure()
+    if failure.code in {CODE_ROOTS_NO_RESPONSE, CODE_ROOTS_ERROR, CODE_ROOT_TOO_BROAD}:
+        detail = "；".join(diagnostics.get("warnings") or ())
+    elif failure.code == CODE_NO_WORKSPACE_ROOT:
+        detail = (
+            f"{ROOTS_ENV} 没设，宿主也没给工作区目录"
+            f"（找过 {', '.join(WORKSPACE_ENVS)}），进程 cwd 也不是可用工作区"
+            "（可能是插件目录，或已在插件更新时被替换）"
+        )
+    else:
+        detail = confirmation.get("error") or ""
+    message = failure.summary
+    if detail:
+        message += f"（{detail}）"
+    return BridgeError(
+        message,
+        code=failure.code,
+        roots=[],
+        disposition=failure.disposition,
+        recovery=failure.next_step,
+        workspace_confirmation=confirmation,
+    )
+
+
+def _within(path: str, root: str) -> bool:
+    try:
+        common = os.path.commonpath([path, root])
+        return os.path.normcase(common) == os.path.normcase(root)
+    except ValueError:  # Windows 上跨盘符 commonpath 直接抛
+        return False
+
+
+def check_scope(path: str) -> str:
+    """把用户给的路径规范化，并确认它落在允许的根之内。
+
+    **越界一律拒绝，绝不「就近找一个能用的」**：Codex 传来的路径可能来自模型
+    的推断，静默换一个目录打开等于在用户没看见的地方改文件。
+    """
+    roots = allowed_roots()
+    if not roots:
+        raise _no_roots_error()
+    # Resolve the untrusted target only after a usable boundary exists.
+    # Windows' ``ntpath.realpath`` may consult cwd even for an absolute path;
+    # doing this first would turn the same deleted-cwd case back into ENOENT.
+    target = os.path.expanduser(str(path))
+    if not os.path.isabs(target):
+        if len(roots) != 1:
+            failure = WORKSPACE_FAILURES[CODE_AMBIGUOUS_ROOT]
+            raise BridgeError(
+                failure.summary,
+                code=failure.code,
+                disposition=failure.disposition,
+                recovery=failure.next_step,
+                roots=roots,
+                path=target,
+            )
+        target = os.path.join(roots[0], target)
+    real = canonical_path(target)
+    if any(_within(real, r) for r in roots):
+        return real
+    failure = WORKSPACE_FAILURES[CODE_PATH_OUT_OF_SCOPE]
+    raise BridgeError(
+        f"{failure.summary}不在范围内的是 {real}；当前允许的根: {os.pathsep.join(roots)}。",
+        code=failure.code,
+        disposition=failure.disposition,
+        recovery=failure.next_step,
+        roots=roots,
+        path=real,
+    )
+
+
+# -------------------------------- 会话 --------------------------------------
+@dataclass
+class Session:
+    id: str
+    project: str
+    stem: str
+    script: str
+    entry: str
+    profile: dict
+    #: 最近一次成功应用的 patches（**全量列表语义**，与前端一致）
+    patches: list = field(default_factory=list)
+    manifest: dict | None = None
+    svg: str | None = None
+    #: 这一版的预览表示法元数据（ADR 0022）。`mode == "raster"` 时 `svg` 是
+    #: None——那是一次**成功**的渲染，只是引擎按硬闸决定不把 SVG 读出来。
+    preview: dict | None = None
+    rev: int = 0
+    created: float = field(default_factory=time.time)
+    last_used: float = field(default_factory=time.time)
+    #: 保留式规范化（ADR 0051）提交后的修改约定；None = 会话自由编辑。
+    #: 合同在会话上时 `apply_overrides` 只接受「原样重发」或带 `user_authorized`
+    #: 的明确要求（后者解除合同）。
+    contract: dict | None = None
+    #: 最近一次通过验收的规范化结果（裁决 + 产物验收 + 那一版的 patch_hash）。
+    #: `patch_hash` 与会话当前不一致时它就是过期的——导出必须如实说出来。
+    normalized: dict | None = None
+    #: 注册表里这张图的开销档位（画布的渲染看门狗按它分级）。
+    cost: str = ""
+    #: 最近一次渲染的 worker 警告；与 manifest / svg 同一次响应。
+    warnings: list = field(default_factory=list)
+    #: raster 档下最近一次渲染**同一次响应**里带回的受控尺寸位图（base64）。
+    #: 非 raster 档恒为 None。留着它是为了 `session_state()` 不必再画一遍：
+    #: 位图与 manifest 的配对纪律（ADR 0022）要求它来自同一次渲染。
+    preview_png_base64: str | None = None
+    preview_png_manifest: dict | None = None
+    #: 最近一次**默认参数**的预检结果（`run_preflight` 不带 profile / journal /
+    #: 导出参数那一档），连同它算出时的 `patch_hash` 与 profile 印章。
+    #: `session_state()` 只在两者都还对得上时复用；否则重算——预检是 manifest
+    #: 与规范的纯函数，键对得上就没有第二个答案。每次 `_render` 都把它清掉：
+    #: manifest 换了一份，键没变也不算数。
+    preflight_cache: dict | None = None
+    #: 最近一次成功 apply 的有界诊断与版本；不复制渲染负载、不落盘，重渲染后失效。
+    #: warnings 只在上面的既有字段保留；超限诊断显式标记，不另留一份无限大的响应。
+    apply_receipt: dict | None = None
+    #: 这个会话是不是**这一次调用里**从落盘记录重建的（ADR 0078）。调用方读一次就清掉，
+    #: 让 apply / session_state 的结果如实带一句 `restored: true`，而不是假装它一直开着。
+    restored: bool = False
+
+    def patch_hash(self) -> str:
+        return patchspec.patch_hash(self.patches)
+
+    def acquire(self):
+        """**每次操作前**从池里重新取 worker，绝不长期抱着引用。
+
+        两个上限是不同的数，而且必然会打架：池按 `MAX_ALIVE`（3）做 LRU
+        淘汰，这里的会话上限是 `MAX_SESSIONS`（8）。开到第 4 个脚本时，
+        第 1 个会话手里那个 worker 已经被池 shutdown 了，可它在账本里还
+        「开着」——用户看到的是「会话明明还在，一 apply 就说 worker 死了」，
+        而且没有任何办法恢复。`pool.get()` 本来就负责「死了就重建」，
+        每次问它一遍即可，代价是一次字典查找。
+        """
+        try:
+            return engine_pool.get(self.script, self.project, self.entry)
+        except engine_pool.WorkerError as exc:
+            raise _bridge_error_from_worker(exc) from exc
+
+
+def _answer_workdir(project: str, mode: str) -> None:
+    """`tavotto_open_figure(workdir=…)`：记住这个项目的运行目录决定（三档闭集）。"""
+    if mode not in engine_workdir.MODES:
+        raise BridgeError(
+            f"不认识的工作目录模式: {mode!r}（可选 {' / '.join(engine_workdir.MODES)}）",
+            code=engine_workdir.ERROR_MODE_INVALID,
+        )
+    before = engine_workdir.mode_for(project)
+    engine_workdir.set_mode(project, mode)
+    if before != mode:
+        # cwd 是 spawn 时定下的：活着的会话还端着旧目录（与 app 的端点同一条纪律）
+        engine_pool.shutdown_all(project)
+
+
+def _answer_prepare_dependencies(project: str, script: str, target: str) -> dict:
+    """`tavotto_open_figure(prepare_dependencies=…)`：对跑前那一次「需要先准备依赖」的回答
+    （U04，ADR 0061）——绑定联合计划 + **同步**执行到终态（几十秒到几分钟：要联网装包），
+    再由调用方接着开图。与桌面授权框 / HTTP 端点是同一份决定、同一个事务。
+
+    `deprepair` 延后 import：它是 U04 才有的能力，桥的最低引擎版本不为它抬（老引擎上
+    `create_joint_plan` 不存在 → `engine_too_old`，不静默）。
+    """
+    from tavotto.engine import deprepair as engine_deprepair  # noqa: PLC0415
+
+    if target not in ("tavotto_managed", "project_venv", "skip"):
+        raise BridgeError(
+            f"不认识的依赖准备目标: {target!r}（可选 tavotto_managed / project_venv / skip）",
+            code="dependency_target_invalid",
+        )
+    create = getattr(engine_deprepair, "create_joint_plan", None)
+    skip = getattr(engine_deprepair, "skip_preparation", None)
+    if create is None or skip is None:
+        raise BridgeError(
+            "本机 Tavotto 版本不支持联合依赖准备，请升级 Tavotto", code="engine_too_old"
+        )
+    if target == "skip":
+        # 用户明确不准备、直接运行：这道门从此放行（缺包会以 missing_dependency 回来）
+        skip(project, script)
+        return {"target_kind": "skip", "generation": "", "installed": {}, "requirements": []}
+    try:
+        plan = create(project, script, target_kind=target)
+        outcome = engine_deprepair.prepare(plan.plan_id)
+    except engine_deprepair.RepairError as exc:
+        joint = (exc.extra or {}).get("joint")
+        raise BridgeError(str(exc), code=exc.code, **({"joint": joint} if joint else {})) from exc
+    if not outcome.get("ok"):
+        code = str(outcome.get("code") or "dependency_install_failed")
+        raise BridgeError(f"依赖准备没有完成: {code}", code=code, result=outcome)
+    return {
+        "target_kind": outcome.get("target_kind", target),
+        "generation": outcome.get("generation", ""),
+        "installed": outcome.get("installed", {}),
+        "requirements": list(plan.requirements),
+    }
+
+
+#: 改指表救不回、只能经确认改写脚本的几档（ADR 0110）。`engine.inputremap.VIAS_NEED_REWRITE` 的镜像：
+#: 插件要能配更早的 Tavotto，不为一个常量多 import 一个新模块（那会抬高 MIN_TAVOTTO_VERSION）；
+#: `tests/test_mcp_server.py` 钉住两侧相等。
+VIAS_NEED_REWRITE = ("probe", "glob", "native")
+
+
+def _bridge_error_from_worker(exc: engine_pool.WorkerError) -> BridgeError:
+    """worker 错误 → 带稳定 code 的 BridgeError；U03 的两种结构化载荷原样带出去。
+
+    * `workdir_confirmation_required`：首开要先选运行目录——这是「需要输入」，不是失败。
+      `confirmation` 进 `structuredContent`（选项 / 证据），`recovery` 告诉 Codex 怎么答：
+      再调一次 `tavotto_open_figure` 并带 `workdir=`（与桌面确认框、HTTP 的
+      `PATCH /api/engine/workdir` 是同一份决定）；
+    * `explicit_python_unusable` / `project_python_unusable`：显式选择失效，不静默换环境——
+      `explicit` 说清是哪一条、为什么。
+    """
+    extra: dict = {"traceback": exc.traceback_text}
+    confirmation = getattr(exc, "confirmation", None)
+    if isinstance(confirmation, dict):
+        extra["confirmation"] = confirmation
+        recommended = confirmation.get("recommended")
+        modes = " / ".join(o.get("mode", "") for o in confirmation.get("options") or [])
+        extra["recovery"] = (
+            "先选脚本的运行目录：再调一次 tavotto_open_figure 并带 workdir 参数"
+            f"（可选 {modes}"
+            + (
+                f"；证据推荐 {recommended}"
+                if recommended
+                else "；两处同名数据内容不同，需要用户决定"
+            )
+            + "）。这个决定按项目记住，只问这一次。"
+        )
+    # 数据找不到（ADR 0106）：缺的是哪一串、脚本里还有哪些也找不到——原样进 `structuredContent`。
+    # 指认位置要用户在本机的选择器里点（改指规则是本机路径、按项目记住），插件不替用户选：
+    # `recovery` 请用户回 Tavotto 窗口里指认，或把数据放回脚本写的位置。
+    missing_input = getattr(exc, "missing_input", None)
+    if isinstance(missing_input, dict):
+        extra["missing_input"] = missing_input
+        primary = (
+            {"path": missing_input.get("requested"), "via": missing_input.get("via")}
+            if missing_input.get("requested")
+            else next((o for o in missing_input.get("others") or [] if o.get("path")), {})
+        )
+        first = primary.get("path") or ""
+        if primary.get("via") in VIAS_NEED_REWRITE:
+            # exists / glob / C++ 读取器（ADR 0110）：只读改指救不回，出路是改写脚本里那串——
+            # 那必须由用户在 Tavotto 窗口里看过逐行改动、勾选确认；插件与 Agent 都不替用户改
+            extra["recovery"] = (
+                f"脚本要的数据找不到：{first}。脚本是用 exists / glob / C++ 读取器去找它的，只读改指救不回。"
+                "请用户在 Tavotto 窗口里打开这张图，在「找不到脚本要读的数据」里选择数据现在的位置，"
+                "Tavotto 会列出脚本里要改的每一行，用户勾选确认后才改写脚本（改之前先备份，可一键复原）；"
+                "或把数据放回脚本写的位置；"
+                "之后再调一次 tavotto_open_figure。不要自己改用户的脚本。"
+            )
+        else:
+            extra["recovery"] = (
+                f"脚本要读的数据找不到：{first}。请用户在 Tavotto 窗口里打开这张图，在弹出的「找不到脚本要读的"
+                "数据」里指认文件或它所在的文件夹（只影响读取、按项目记住），或把数据放回脚本写的位置；"
+                "之后再调一次 tavotto_open_figure。不要改用户的脚本。"
+            )
+    explicit = getattr(exc, "explicit", None)
+    if isinstance(explicit, dict):
+        extra["explicit"] = {
+            k: explicit.get(k, "") for k in ("source", "reason", "trigger") if k in explicit
+        }
+        extra["recovery"] = (
+            "Tavotto 不会自动换成别的环境：请用户在设置里重新指定渲染环境，或清除那条设置回到自动选择。"
+        )
+    # `dependency_preparation_required`（U04，ADR 0061）：脚本开跑要的包目标环境里没有、能一次
+    # 装全——这是「需要输入」，不是失败。整份联合计划进 `structuredContent`，`recovery` 告诉
+    # Codex 怎么答：再调一次 `tavotto_open_figure` 并带 `prepare_dependencies=`（与桌面授权框、
+    # HTTP 的 `/api/engine/dependencies/plan` + `/prepare` 是同一份决定）。
+    dependency = getattr(exc, "dependency_preparation", None)
+    if isinstance(dependency, dict):
+        extra["dependency_preparation"] = dependency
+        plan = dependency.get("plan") or {}
+        reqs = ", ".join(plan.get("requirements") or [])
+        kinds = " / ".join(t.get("kind", "") for t in dependency.get("targets") or [])
+        unknown = ", ".join(plan.get("unknown") or [])
+        # 先下载 Tavotto 自己的 Python（U05，ADR 0063）——体积必须说出口（与桌面授权框同一句话）。两种形状：
+        # 顶层 `private_python` = 这台机器没有可用的 Python（干净机器，哪个目标都得先下）；只挂在受管目标
+        # `targets[].private_python` 上 = 有渲染解释器（比如桌面壳自带的那份）但没有能建受管环境的基础解释器
+        # ——选 tavotto_managed 才会下（Codex #475 P2）
+        private = dependency.get("private_python") or {}
+        managed_private = next(
+            (
+                t.get("private_python") or {}
+                for t in dependency.get("targets") or []
+                if t.get("kind") == "tavotto_managed"
+            ),
+            {},
+        )
+        # 载荷在就说（`required=False` 的是「已就位、不联网」那句——来源照样要说出口）
+        if private:
+            lead = " 这台电脑没有可用的 Python：授权后会先"
+        elif managed_private:
+            lead, private = " 选择 tavotto_managed 时会先", managed_private
+        else:
+            lead = ""
+        if lead:
+            mb = max(1, round(int(private.get("download_bytes") or 0) / 1048576))
+            private_note = (
+                f"{lead}使用已下载并校验过的 Tavotto 自己的 Python {private.get('version', '')}（不联网）。"
+                if private.get("cached")
+                else f"{lead}下载 Tavotto 自己的 Python {private.get('version', '')}（约 {mb} MB）"
+                "到 Tavotto 的数据目录，不改动系统与 PATH。"
+            )
+        else:
+            private_note = ""
+        extra["recovery"] = (
+            f"脚本开跑就需要的包目标环境里没有：{reqs}。请用户授权一次联合安装：再调一次 "
+            f"tavotto_open_figure 并带 prepare_dependencies=<目标>（可选 {kinds}；"
+            "tavotto_managed 是 Tavotto 自己的隔离环境、不改用户环境，project_venv 会修改项目自己的 "
+            "venv；skip = 不准备、直接运行）。安装需要联网、只装预编译 wheel；这道门一直问到有答案。"
+            + (f" 认不出对应包名、不会安装的 import：{unknown}。" if unknown else "")
+            + private_note
+        )
+    return BridgeError(str(exc), code=exc.code or "worker_error", **extra)
+
+
+_SESSIONS: dict[str, Session] = {}
+
+
+def sessions() -> dict[str, Session]:
+    return _SESSIONS
+
+
+def _journal_dir() -> Path:
+    return Path(engine_config.data_dir()) / sessionjournal.DIRNAME
+
+
+def _persist(session: Session) -> None:
+    """把会话**已提交**的状态落盘（ADR 0078）。只在提交点调：open / apply / 规范化收尾。
+
+    落盘失败不让这次工具调用失败——图已经改好了；但要说出来（stderr 归日志，stdout
+    归协议），因为后果是「server 进程换了之后这个会话恢复不了」。
+    """
+    record = {
+        "id": session.id,
+        "project": session.project,
+        "stem": session.stem,
+        "profile": session.profile,
+        "patches": list(session.patches),
+        "contract": session.contract,
+        "normalized": session.normalized,
+        "cost": session.cost,
+        "created": session.created,
+    }
+    try:
+        sessionjournal.save(_journal_dir(), record)
+    except (OSError, ValueError, TypeError) as exc:
+        sys.stderr.write(f"tavotto-mcp: 会话 {session.id} 落盘失败，进程换了之后恢复不了：{exc}\n")
+
+
+def _forget(session_id: str) -> None:
+    """明确释放（关闭 / 淘汰）的会话连记录一起删：它们不该在别的进程里复活。"""
+    sessionjournal.delete(_journal_dir(), session_id)
+
+
+def _restore_session(session_id: str) -> Session | None:
+    """内存里没有这个会话时，按落盘记录在**本进程**重建它（ADR 0078）。
+
+    记录只提供「是哪张图、改到了哪一步」，**不提供任何权限**：
+
+    * 项目路径重新规范化，必须落在**当前连接**的允许根之内——根不对就按
+      `workspace_root_changed` 拒，**不渲染、不执行脚本**；
+    * 脚本 / 入口从项目注册表重新读（记录里根本不存它们），stem 不在了就拒；
+    * 渲染走 `_render` 全量列表语义，与画布 / open 同一条路。
+
+    没有记录（从没开过 / 已关闭 / 已淘汰 / 过期 / 坏的）返回 None，调用方照旧报
+    `unknown_session`。
+    """
+    record = sessionjournal.load(_journal_dir(), session_id)
+    if record is None:
+        return None
+    roots = allowed_roots()
+    try:
+        project = canonical_path(record["project"])
+    except (OSError, ValueError):
+        project = None
+    if (
+        not roots
+        or project is None
+        or not os.path.isdir(project)
+        or not any(_within(project, root) for root in roots)
+    ):
+        raise BridgeError(
+            f"会话 {session_id} 的项目不在当前工作区根内，不能在这里恢复，请重新打开。",
+            code="workspace_root_changed",
+            roots=roots,
+            project=record["project"],
+            resolved_project=project,
+        )
+    try:
+        registry = engine_registry.open_registry(project)
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise BridgeError(
+            f"会话 {session_id} 恢复失败：项目的脚本注册表读不了（{exc}），请重新打开。",
+            code="session_restore_failed",
+            reason="registry",
+        ) from exc
+    info = registry.for_stem(record["stem"])
+    if info is None:
+        _forget(session_id)
+        raise BridgeError(
+            f"会话 {session_id} 恢复失败：注册表里已经没有 {record['stem']}，请重新打开。",
+            code="session_restore_failed",
+            reason="stem_gone",
+        )
+    session = Session(
+        id=session_id,
+        project=project,
+        stem=record["stem"],
+        script=info["script"],
+        entry=info["entry"],
+        profile=record["profile"],
+        cost=str(info.get("cost", "") or ""),
+        contract=record.get("contract"),
+        normalized=record.get("normalized"),
+    )
+    if isinstance(record.get("created"), (int, float)):
+        session.created = float(record["created"])
+    # 先渲染成功，再登记（与 open 同一条纪律）；渲染失败时记录留着，下次还能再试
+    _render(session, list(record["patches"]), preview_dpi=None)
+    session.restored = True
+    _SESSIONS[session.id] = session
+    _evict_if_needed()
+    return session
+
+
+def get_session(session_id: str) -> Session:
+    s = _SESSIONS.get(session_id)
+    if s is None:
+        s = _restore_session(session_id)
+    if s is None:
+        known = ", ".join(sorted(_SESSIONS)) or "（没有打开的会话）"
+        raise BridgeError(
+            f"没有这个会话: {session_id}。先调用 tavotto_open_figure。已打开: {known}",
+            code="unknown_session",
+        )
+    roots = allowed_roots()
+    current_project: str | None = None
+    resolution_error: str | None = None
+    if roots:
+        try:
+            # ``s.project`` was canonical when the session opened, but the path can
+            # later be replaced by a symlink/junction. Re-resolve it before every
+            # operation so the stored lexical path cannot outlive its authority.
+            current_project = canonical_path(s.project)
+        except (OSError, ValueError) as exc:
+            resolution_error = str(exc)
+    if (
+        not roots
+        or current_project is None
+        or not os.path.isdir(current_project)
+        or not any(_within(current_project, root) for root in roots)
+    ):
+        _SESSIONS.pop(session_id, None)
+        s.apply_receipt = None
+        raise BridgeError(
+            f"会话 {session_id} 的项目已不在当前工作区根内，请重新打开。",
+            code="workspace_root_changed",
+            roots=roots,
+            project=s.project,
+            resolved_project=current_project,
+            resolution_error=resolution_error,
+        )
+    s.last_used = time.time()
+    return s
+
+
+def close_session(session_id: str) -> dict:
+    s = _SESSIONS.pop(session_id, None)
+    # 关闭是明确的释放：落盘记录一起删，别的进程里也不能再把它恢复出来
+    _forget(session_id)
+    if s is None:
+        return {
+            "ok": True,
+            "closed": False,
+            "note": f"会话 {session_id} 已经不在了（重复关闭不算错）",
+        }
+    s.apply_receipt = None
+    # worker 归 pool 管（同一个脚本可能还有别的用户）：这里只丢引用与会话账本。
+    # 用户的项目数据一个字节都不动。
+    return {
+        "ok": True,
+        "closed": True,
+        "session_id": session_id,
+        "project": s.project,
+        "stem": s.stem,
+    }
+
+
+def _evict_if_needed() -> list[str]:
+    """超额时按最久未用淘汰，**并把淘汰了谁交出去**。
+
+    静默淘汰的表现是「我手上的 session_id 突然 unknown_session，而我什么都没做」
+    ——调用方甚至说不出它是什么时候没的。返回值让 open 那一路当场说出口。
+    """
+    evicted: list[str] = []
+    while len(_SESSIONS) > MAX_SESSIONS:
+        oldest = min(_SESSIONS.values(), key=lambda s: s.last_used)
+        _SESSIONS.pop(oldest.id, None)
+        oldest.apply_receipt = None
+        # 淘汰也是明确的释放（open 的文字里会点名）：不许在下一次调用里悄悄复活
+        _forget(oldest.id)
+        evicted.append(oldest.id)
+    return evicted
+
+
+def _live_session_for(project: str, stem: str) -> Session | None:
+    """这张图是不是已经**原样**开着了？是就沿用，不新建第二个会话。
+
+    同一张图开两个会话没有任何好处，代价却是实打实的：账本多占一格，超额时
+    `_evict_if_needed()` 就会挤掉别的图——**批量打开之后再单独开其中一张来看
+    画布，挤掉的正好是这一批里先开的那几个**（它们最久没用）。旧行为下这一步
+    是静默的，用户手上剩下的是几个「开着却已经不存在」的 session_id。
+
+    **只沿用还没改过的会话（`patches` 为空）**，这不是保守，是画布的账本决定的：
+    `web/src/mcp/session.ts` 的 `seedSession()` 用 `overrides: []` 去 seed 面板
+    （`main.tsx` 里写着为什么），沿用一个已经带着 patch 的会话会让画布的账本与
+    引擎状态对不上——画面是改过的，账本是空的，用户下一次编辑就把之前的修改
+    静默还原了。改过的图要重开，就诚实地新建一个会话。
+    """
+    live = [
+        s for s in _SESSIONS.values() if s.project == project and s.stem == stem and not s.patches
+    ]
+    return max(live, key=lambda s: s.last_used) if live else None
+
+
+def shutdown_all() -> None:
+    """进程退出前收摊：会话账本清空 + 关掉 worker 子进程（不留孤儿）。"""
+    for session in _SESSIONS.values():
+        session.apply_receipt = None
+    _SESSIONS.clear()
+    try:
+        engine_pool.shutdown_all(wait=True)
+    except Exception:  # noqa: BLE001 — 收尾不许连累退出
+        pass
+
+
+# ------------------------------ 打开一张图 -----------------------------------
+def _pick_stem(project: str, stem: str | None, registry) -> str:
+    if stem:
+        if registry.for_stem(stem) is None:
+            raise BridgeError(
+                f"注册表里没有 stem「{stem}」——这张图没有对应脚本，只能当素材排版。"
+                "把产出它的 .py 放到产物同一个目录，并让产物名是脚本里的字面量。",
+                code="stem_not_parameterizable",
+                known=sorted(registry.entries()) and _all_stems(registry),
+            )
+        return stem
+    on_disk = []
+    for script in registry.all_scripts():
+        for s in registry.stems_of(script):
+            for ext in engine_handoff.OUT_EXTS:
+                if os.path.isfile(os.path.join(project, s + ext)):
+                    on_disk.append(s)
+                    break
+    if not on_disk:
+        raise BridgeError(
+            f"{project} 里没有任何已登记且产物在磁盘上的图。先把脚本跑一遍。", code="no_figure"
+        )
+    if len(on_disk) > 1:
+        raise BridgeError(
+            f"这个项目里有多张图，得点名要哪一张: {', '.join(sorted(on_disk))}",
+            code="stem_required",
+            stems=sorted(on_disk),
+        )
+    return on_disk[0]
+
+
+def _all_stems(registry) -> list[str]:
+    return sorted({s for script in registry.all_scripts() for s in registry.stems_of(script)})
+
+
+@dataclass
+class _ProjectCtx:
+    """一次交接解析的结果：项目、注册表、以及目标自带的 stem（如果有）。
+
+    单图与批量两条路**共用同一段解析**——范围校验的顺序、注册表的错误码、
+    `ensure_registered` 的写时机在这里只有一份。批量那条路要先拿到注册表才
+    知道有哪些 stem，复制一份解析等于给「越界一律拒」开第二个入口。
+    """
+
+    project: str
+    reg_info: dict
+    registry: object
+    target_stem: str | None
+
+
+def _resolve_project(target: str, stem: str | None) -> _ProjectCtx:
+    """`target`（产物 / 脚本 / 图库目录）→ 已授权的项目 + 注册表。
+
+    解析规则复用 `engine/handoff.py`（`tavotto open` 走的是同一条），
+    **这里不另写一套判断**。
+    """
+    real = check_scope(target)
+    if not os.path.exists(real):
+        raise BridgeError(f"路径不存在: {real}", code="not_found")
+    try:
+        found = engine_handoff.resolve_target(real)
+    except engine_handoff.HandoffError as exc:
+        raise BridgeError(str(exc), code="handoff_failed") from exc
+
+    # **范围校验必须在 `ensure_registered` 之前**：解析会沿目录向上找
+    # `tavotto_registry.json`（最多三层），允许的根嵌套在一个本身已是图库的目录
+    # 下面时，`found.project` 会落到根之外。而 `ensure_registered` 是**写**
+    # 操作（合并并写回注册表）——先登记后校验的话，一次「最终被拒绝」的
+    # 调用照样改了范围外的文件，边界就形同虚设了。
+    project = check_scope(found.project)
+    try:
+        reg_info = engine_handoff.ensure_registered(project, found.stem or stem)
+    except engine_handoff.HandoffError as exc:
+        raise BridgeError(str(exc), code="handoff_failed") from exc
+    try:
+        registry = engine_registry.open_registry(project)
+    except FileNotFoundError as exc:
+        raise BridgeError(
+            f"{project} 里没有脚本注册表（tavotto_registry.json），"
+            "这个目录还不是一个 Tavotto 图库。",
+            code="no_registry",
+        ) from exc
+    except RuntimeError as exc:  # 注册表损坏 / 重复 stem
+        raise BridgeError(f"注册表无法加载: {exc}", code="bad_registry") from exc
+    return _ProjectCtx(
+        project=project, reg_info=reg_info, registry=registry, target_stem=found.stem
+    )
+
+
+def open_figure(
+    target: str,
+    *,
+    stem: str | None = None,
+    profile_id: str | None = None,
+    journal: dict | None = None,
+    include_png: bool = False,
+    workdir: str | None = None,
+    prepare_dependencies: str | None = None,
+) -> dict:
+    """解析 → 登记 → 起会话 → 渲染一次。返回给 Codex 的第一份快照。
+
+    `workdir` 是对首开那一次「需要输入」的回答（U03，ADR 0057）：与桌面确认框、HTTP 的
+    `PATCH /api/engine/workdir` 同一份决定——记进项目设置、关掉这个项目的旧会话，再开。
+    没给就按后端自己的决定走（决定过的直接用；没决定过而证据要问的，这次 open 以
+    `workdir_confirmation_required` 回来）。
+
+    `prepare_dependencies` 是对跑前那一次「需要先准备依赖」的回答（U04，ADR 0061）：目标
+    `tavotto_managed` / `project_venv`，先同步把联合安装做完再开图；返回里多一段 `prepared`。
+    没给而脚本开跑要的包目标里没有时，这次 open 以 `dependency_preparation_required` 回来。
+    """
+    ctx = _resolve_project(target, stem)
+    project, reg_info, registry = ctx.project, ctx.reg_info, ctx.registry
+    if workdir is not None:
+        _answer_workdir(project, workdir)
+
+    want = stem or ctx.target_stem
+    chosen = _pick_stem(project, want, registry)
+    info = registry.for_stem(chosen)
+    assert info is not None
+    prepared = None
+    if prepare_dependencies is not None:
+        prepared = _answer_prepare_dependencies(project, info["script"], prepare_dependencies)
+
+    # 目录级交接时 `ensure_registered` 还不知道要哪个 stem，`parameterizable`
+    # 会是 None。stem 定下来之后必须补判——留着 None 等于把「这张图能不能进
+    # 图内编辑」这个最要紧的结论交白卷。
+    if reg_info.get("parameterizable") is None:
+        reg_info["parameterizable"] = registry.for_stem(chosen) is not None
+
+    # `run_preflight` 那条路早就把 ProfileError 翻成了 `unknown_profile`，
+    # 这条入口漏了——同一个坏 profile_id，从 open 进来是一条泛化的 JSON-RPC
+    # internal error（调用方分诊不了），从 preflight 进来才是可读的 code。
+    # 用户自建的规范也要认得（`profilestore.resolve_spec` 是「任意 id → 规范」
+    # 的唯一入口；`engine_profiles.load` 只读内置那份 canonical JSON）。
+    try:
+        profile = engine_profilestore.resolve_spec(profile_id, journal)
+    except (engine_profiles.ProfileError, engine_profilestore.ProfileStoreError) as exc:
+        raise BridgeError(str(exc), code="unknown_profile") from exc
+
+    session = _live_session_for(project, chosen)
+    reused = session is not None
+    evicted: list[str] = []
+    if session is not None:
+        # 沿用时**照样重渲染一次**（`patches` 按定义是空的）：open 的返回里
+        # manifest / SVG / 位图必须与会话此刻的状态配对（ADR 0022 不变量 5），
+        # 把上一次的快照直接回给画布等于让它显示一个可能已经过期的画面，
+        # raster 档下更是连位图都没有。
+        session.profile = profile
+        # 开销档位跟着**这次**读到的注册表走：刷新过项目、light 变 heavy 之后沿用旧值，
+        # 画布经 `session_state` 拿到的就是旧档，渲染看门狗会按 2 分钟而不是 15 分钟
+        # 掐掉一次合法的重渲染（Codex 评审）。
+        session.cost = str(info.get("cost", "") or "")
+        render = _render(session, list(session.patches), preview_dpi=None)
+    else:
+        session = Session(
+            id="s-" + uuid.uuid4().hex[:12],
+            project=project,
+            stem=chosen,
+            script=info["script"],
+            entry=info["entry"],
+            profile=profile,
+            cost=str(info.get("cost", "") or ""),
+        )
+        # **先渲染成功，再登记会话**：脚本 build 阶段抛异常时调用方只拿到一个
+        # 错误，永远拿不到 session_id，也就永远关不掉它。反复失败的 open 会把
+        # 账本堆满，再靠 `_evict_if_needed()` 把**真正在用的**会话挤出去。
+        render = _render(session, [], preview_dpi=None)
+        _SESSIONS[session.id] = session
+        evicted = _evict_if_needed()
+    _persist(session)
+    out = {
+        "ok": True,
+        "session_id": session.id,
+        #: 这次是沿用了已经开着的会话，还是新建了一个
+        "reused": reused,
+        #: 这次开图挤掉了谁（按最久未用）。空列表 = 一个都没挤掉。
+        "evicted_sessions": evicted,
+        "project": project,
+        "stem": chosen,
+        "script": info["script"],
+        "entry": info["entry"],
+        "cost": info.get("cost", ""),
+        "registry": {
+            "parameterizable": reg_info.get("parameterizable"),
+            "conflicts": reg_info.get("conflicts", []),
+            "dynamic_names": reg_info.get("dynamic_names", []),
+            "stems": _all_stems(registry),
+        },
+        "profile": engine_profiles.stamp(profile),
+        **render,
+    }
+    if prepared is not None:
+        out["prepared"] = prepared
+    if include_png:
+        # 位图是**顺带产物**，不是这次 open 的成败判据。
+        #
+        # 它由第二次独立的 worker 调用产出（超时/崩溃/磁盘错误都可能），而
+        # 会话此刻**已经建好并登记**了。让它抛出去的话，调用方收到的是一条
+        # isError 结果，`BridgeError.payload()` 里没有 session_id——于是这条
+        # 会话谁也关不掉，占着账本直到被 `_evict_if_needed()` 挤出去，
+        # 而被挤掉的往往是**真正在用**的那条。
+        #
+        # 失败不静默：降级但如实回一个 code，调用方要么重试要么就看 SVG
+        # （显示本来就走 SVG，位图只是给不能渲染 SVG 的 host 兜底）。
+        # raster 档的渲染已经在同一次响应里带了一张（ADR 0022）——**别再画一次**。
+        # 那张更小（RASTER_PREVIEW_WIDTH_PX），但它是画布此刻要显示的东西，
+        # 而 `include_png` 要的只是「顺带给我一张位图」。为了 400px 的差别
+        # 让 #181 那种图多画一遍不划算。
+        if "preview_png_base64" not in out:
+            try:
+                out["preview_png_base64"] = preview_png(session, [], 1600)
+            except BridgeError as exc:
+                out["preview_png_error"] = exc.code or "preview_failed"
+    return out
+
+
+# --------------------------- 批量打开（issue #174） --------------------------
+#: 批量响应的标记。`mode == BATCH_MODE` 的结果**不是**一次单图 open：它没有
+#: 顶层 `session_id` / `manifest` / `svg`，谁也不能把它当成单图结果读。
+BATCH_MODE = "batch"
+
+#: 批量的结局是**三档**，词汇沿用 `engine/exportjob.py`（那里 `partial` 已经
+#: 是独立一档）。把 `partial` 并进 `done` 会把「四张里坏了一张」报成全成功，
+#: 并进 `failed` 会让调用方把已经开好的三个会话当垃圾丢掉——那三个会话是真的
+#: 开着的，丢掉就再也没人关得掉它们。
+BATCH_DONE = "done"
+BATCH_PARTIAL = "partial"
+BATCH_FAILED = "failed"
+
+#: 三个桶：开成了 / 试过并失败了 / **根本没试**。第三个不是失败的一种说法：
+#: 会话预算用光时那些 stem 谁也不知道它们能不能打开，把它们记进 `failed` 等于
+#: 报了一个没测量过的结论（`docs` 与 AGENTS 里那条「不知道是独立一档」）。
+BATCH_BUCKETS = ("opened", "failed", "skipped")
+
+
+def discover_stems(project: str, registry) -> list[str]:
+    """**从注册表**发现可批量打开的 stem —— 不猜。
+
+    判据两条，缺一不可：
+
+    1. **在注册表里**（`for_stem` 解得出脚本）——注册表里有就是可参数化的，
+       这也正是 `registry.parameterizable` 的定义。目录里躺着一个没登记的
+       `.pdf` 不算：它没有产出它的脚本，打开也只能当素材排版。
+    2. **产物在磁盘上**——与 `_pick_stem` 自动挑图用的是同一条判据。脚本静态
+       解得出名字但从没跑过的 stem 不进批量，否则一次「打开四张图」会变成
+       一次谁也没要求过的批量重跑。
+
+    这里**不 probe、不跑用户脚本**（`dynamic_names` 那类脚本静态解不出 stem，
+    自然也不会出现在注册表里）。
+    """
+    found: list[str] = []
+    for stem in _all_stems(registry):
+        for ext in engine_handoff.OUT_EXTS:
+            if os.path.isfile(os.path.join(project, stem + ext)):
+                found.append(stem)
+                break
+    return found
+
+
+def _failure_entry(stem: str, exc: BridgeError) -> dict:
+    payload = {k: v for k, v in exc.payload().items() if k != "ok"}
+    # `stem` 放最后：它是**这次请求点名的那张图**，谁也不能被 BridgeError 的
+    # extra 覆盖掉。关闭条件里「失败那张点得出名字」靠的就是这个字段。
+    return {**payload, "stem": stem}
+
+
+def open_figures(
+    target: str,
+    *,
+    stems: list[str] | None = None,
+    discover: bool = False,
+    profile_id: str | None = None,
+    journal: dict | None = None,
+    workdir: str | None = None,
+) -> dict:
+    """一次调用打开 N 张独立的图，拿回 N 个**各自可编辑**的会话。
+
+    每一张都走 `open_figure` 那条路——同一套范围校验、同一套注册表判断、同一个
+    `_render`。这里加的只有三件事：清单从哪来、一张失败了别连累其余、以及把
+    结局如实分成三档。
+
+    **一张失败不回滚整批**：已经渲染成功的会话照常登记，调用方拿 session_id
+    继续 `tavotto_apply_overrides` / `tavotto_export`，与单开出来的会话没有任何
+    区别。失败那张带着稳定 code 与它自己的 stem 名回来。
+    """
+    ctx = _resolve_project(target, None)
+    if workdir is not None:
+        # 首开那一次回答是**项目级**的：批量与单张同一处记账，在开任何一张之前落地
+        # （Codex #456 P2：批量重试带 workdir 时不能静默忽略）
+        _answer_workdir(ctx.project, workdir)
+    if discover:
+        wanted = discover_stems(ctx.project, ctx.registry)
+        source = "discover"
+        if not wanted:
+            raise BridgeError(
+                f"{ctx.project} 里没有任何「已登记且产物在磁盘上」的图可供批量打开。"
+                "先把脚本跑一遍，或用 stems 点名。",
+                code="no_figure",
+                project=ctx.project,
+                registry_stems=_all_stems(ctx.registry),
+            )
+    else:
+        # 去重但保持调用方给的顺序：同一个 stem 开两次只会得到两个指向同一张图
+        # 的会话，白占预算。
+        seen: set[str] = set()
+        wanted = [s for s in (stems or []) if not (s in seen or seen.add(s))]
+        source = "stems"
+
+    opened: list[dict] = []
+    failed: list[dict] = []
+    skipped: list[dict] = []
+    for stem in wanted:
+        # **预算在开之前问，不靠事后淘汰**：`_evict_if_needed()` 按 last_used
+        # 淘汰，而同一批里先开的那几个正好最久没用——超额批量的表现会是「返回了
+        # 八个 session_id，前几个已经被自己这一批挤掉了」，看上去还是全成功。
+        if len(_SESSIONS) >= MAX_SESSIONS:
+            skipped.append(
+                {
+                    "stem": stem,
+                    "code": "session_budget_exhausted",
+                    "error": (
+                        f"会话数已达上限 {MAX_SESSIONS}，这张没有尝试打开。"
+                        "先 tavotto_close_session 关掉不用的，再打开剩下的。"
+                    ),
+                }
+            )
+            continue
+        try:
+            one = open_figure(ctx.project, stem=stem, profile_id=profile_id, journal=journal)
+        except BridgeError as exc:
+            failed.append(_failure_entry(stem, exc))
+            continue
+        except Exception as exc:  # noqa: BLE001 — 见下
+            # 一张图的意外异常不该打死整批，但**「不认识的错」要自成一档**：
+            # 套一个现成的 code 会把一个没人诊断过的失败伪装成已知形态。
+            failed.append(
+                {
+                    "stem": stem,
+                    "code": "unexpected_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+        opened.append(_batch_entry(one))
+
+    counts = {
+        "requested": len(wanted),
+        "opened": len(opened),
+        "failed": len(failed),
+        "skipped": len(skipped),
+    }
+    if not opened:
+        # 一张都没开成：这次调用**真的失败了**，`isError` 该是 true。细节照样
+        # 带在 payload 里（每张的 code 与 stem 名一个不少），调用方分诊得了。
+        raise BridgeError(
+            f"批量打开：{counts['requested']} 张一张也没打开成功。",
+            code="batch_all_failed",
+            mode=BATCH_MODE,
+            status=BATCH_FAILED,
+            project=ctx.project,
+            source=source,
+            requested=list(wanted),
+            counts=counts,
+            failed=failed,
+            skipped=skipped,
+        )
+    return {
+        "ok": True,
+        "mode": BATCH_MODE,
+        # **结局看 `status`，不是看 `ok`**：`ok` 只说这次调用做完了它能做的。
+        "status": BATCH_DONE if len(opened) == len(wanted) else BATCH_PARTIAL,
+        "project": ctx.project,
+        "source": source,
+        "requested": list(wanted),
+        "counts": counts,
+        "opened": opened,
+        "failed": failed,
+        "skipped": skipped,
+    }
+
+
+def _batch_entry(one: dict) -> dict:
+    """单图 open 结果 → 批量里的一条**摘要**。
+
+    批量刻意不回 manifest / SVG / 位图：`structuredContent` 会整份进模型上下文，
+    四张图的 manifest 加四份 SVG 就是 #102 抱怨的那种「糊一屏」，只是换了个层级。
+    要 manifest 就对那个 stem 单独调一次 `tavotto_open_figure`——会话是同一个
+    语义，画布也只在那一次挂得出来。
+    """
+    manifest = one.get("manifest") or {}
+    return {
+        "session_id": one["session_id"],
+        "stem": one["stem"],
+        "script": one["script"],
+        "entry": one["entry"],
+        "cost": one.get("cost", ""),
+        "size_mm": manifest.get("size_mm"),
+        "elements": len(manifest.get("elements") or []),
+        "patch_hash": one["patch_hash"],
+        "render_revision": one.get("render_revision"),
+        "profile": one["profile"],
+        "parameterizable": (one.get("registry") or {}).get("parameterizable"),
+        "preview_mode": (one.get("preview") or {}).get("mode"),
+        "warnings": one.get("warnings", []),
+    }
+
+
+# ------------------------------- 刷新（ADR 0041） ----------------------------
+#: 刷新的来由固定是 codex：它进日志、进事件、进遥测维度，模型传什么都不透传。
+REFRESH_REASON = "codex"
+#: 结果里 `delivered` 的两个取值。**不是成败**——两条路都成功刷新了磁盘上的
+#: 事实；区别只在运行中的 Tavotto 界面这一次有没有同步到。
+DELIVERED_APP = "app"
+DELIVERED_LOCAL = "local"
+
+
+def project_id(project: str) -> str:
+    """项目短 id，与 `app._project_id()` 同一把尺（`normalize_path_identity`）。
+    刷新结果里**用它代替绝对路径**：Codex 要的是「这个项目变了什么」，不是
+    用户的目录结构。"""
+    key = engine_config.normalize_path_identity(project)
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
+
+class _RefreshCtx:
+    """`refresh_project_index()` / `readiness.compute()` 要的三样东西。
+
+    这是**本进程**那份项目状态，不是运行中的 Tavotto 手里那份：它只在
+    Tavotto 没开着时才被用到（`DELIVERED_LOCAL`），刷新状态（素材基线、
+    注册表修订号、就绪度缓存）挂在它身上，同一个项目跨调用复用，于是第二次
+    起素材 diff 是真的跨轮比（第一次如实报 `baseline: true`）。
+    """
+
+    def __init__(self, project: str, registry) -> None:
+        self.path = Path(project)
+        self.id = project_id(project)
+        self.registry = registry
+
+
+_REFRESH_CTX: dict[str, _RefreshCtx] = {}
+
+
+def _local_refresh_ctx(project: str) -> _RefreshCtx:
+    ctx = _REFRESH_CTX.get(project)
+    if ctx is not None:
+        return ctx
+    try:
+        registry = engine_registry.open_registry(project)
+    except FileNotFoundError as exc:
+        raise BridgeError(
+            "这个目录还不是一个 Tavotto 图库（没有 tavotto_registry.json）。"
+            "先用 tavotto_open_figure 打开其中一张图（它会登记），再刷新。",
+            code="no_registry",
+        ) from exc
+    except RuntimeError as exc:
+        raise BridgeError(f"注册表无法加载: {exc}", code="bad_registry") from exc
+    ctx = _REFRESH_CTX[project] = _RefreshCtx(project, registry)
+    return ctx
+
+
+def resolve_refresh_project(
+    *, session_id: str | None = None, project_path: str | None = None
+) -> str:
+    """刷新哪个项目。**项目上下文来自授权，不来自模型的自由文本。**
+
+    三条路，按可信度排：
+    1. `session_id` → 那个会话的项目（`get_session` 会重新做范围校验）；
+    2. `project_path` → 与 `tavotto_open_figure` 同一套：`check_scope` →
+       `handoff.resolve_target` 沿目录向上找图库 → 再 `check_scope` 一次；
+    3. 都不传 → 当前**恰好一个**项目有会话时用它；零个报 `no_project`，
+       多个报 `ambiguous_project`（列的是会话 id，不是路径）。
+    """
+    if session_id:
+        return get_session(str(session_id)).project
+    if project_path:
+        real = check_scope(str(project_path))
+        if not os.path.exists(real):
+            raise BridgeError(f"路径不存在: {real}", code="not_found")
+        try:
+            found = engine_handoff.resolve_target(real)
+        except engine_handoff.HandoffError as exc:
+            raise BridgeError(str(exc), code="handoff_failed") from exc
+        return check_scope(found.project)
+    projects = sorted({s.project for s in _SESSIONS.values()})
+    if len(projects) == 1:
+        return check_scope(projects[0])
+    if not projects:
+        raise BridgeError(
+            "没有打开的会话，也没有传 project_path：先 tavotto_open_figure 打开一张图，"
+            "或传一个已授权工作区内的项目目录。",
+            code="no_project",
+        )
+    raise BridgeError(
+        "有多个项目开着会话，说不清要刷新哪一个：传 session_id 或 project_path。",
+        code="ambiguous_project",
+        sessions={sid: project_id(s.project) for sid, s in _SESSIONS.items()},
+    )
+
+
+def _app_reachable(port: int, http_status) -> bool:
+    st, _ = http_status(f"http://127.0.0.1:{port}/api/version", timeout=0.6)
+    return st is not None
+
+
+def _remote_refresh(port: int, project: str, http_status) -> tuple[dict, dict | None]:
+    """把刷新**委托给运行中的 Tavotto**：它持有项目的 ctx、watcher 与 SSE，
+    刷新在那儿做完，前端当场收到 `registry.changed` / `assets.changed`。
+
+    `default: false`——只让它端着这个项目，不改别的标签页的默认落点
+    （与 `handoff._remote_probe` 同一条纪律）。刷新失败原样带回它的 code，
+    **不退回本地再试一遍**：同一份磁盘事实，它刷不成本地也刷不成。
+    """
+    base = f"http://127.0.0.1:{port}"
+    st, opened = http_status(
+        f"{base}/api/projects/open", {"path": project, "default": False}, timeout=10.0
+    )
+    pj = (opened or {}).get("id")
+    if st != 200 or not pj:
+        raise BridgeError(
+            f"运行中的 Tavotto 打不开这个项目: {(opened or {}).get('error') or f'HTTP {st}'}",
+            code="remote_open_failed",
+        )
+    q = f"?pj={quote(pj, safe='')}"
+    st, result = http_status(
+        f"{base}/api/project/refresh{q}", {"reason": REFRESH_REASON}, timeout=60.0
+    )
+    if st != 200 or not isinstance(result, dict):
+        raise BridgeError(
+            f"运行中的 Tavotto 刷新失败: {(result or {}).get('error') or f'HTTP {st}'}",
+            code=str((result or {}).get("code") or "refresh_failed"),
+            params=(result or {}).get("params") or {},
+        )
+    st, readiness = http_status(f"{base}/api/project/readiness{q}", timeout=30.0)
+    return result, readiness if st == 200 and isinstance(readiness, dict) else None
+
+
+def _local_refresh(project: str) -> tuple[dict, dict]:
+    """Tavotto 没开着：在本进程调**同一份**刷新服务（`engine/project_refresh`），
+    不复制扫描算法、不 probe、不跑脚本。没有 SSE 可发（没人在听），下次
+    Tavotto 打开这个项目时读到的就是刷新后的注册表。"""
+    ctx = _local_refresh_ctx(project)
+    try:
+        result = engine_refresh.refresh_project_index(ctx, reason=REFRESH_REASON, publish=False)
+    except engine_refresh.RefreshError as exc:
+        raise BridgeError(exc.message, code=exc.code, params=exc.params) from exc
+    return result, engine_readiness.compute(ctx)
+
+
+def _compact_readiness(report: dict | None) -> dict | None:
+    """就绪度报告 → Codex 要看的那几列。id / stem / 脚本都是项目相对的。"""
+    if not isinstance(report, dict):
+        return None
+    panels = [
+        {
+            "id": p.get("id"),
+            "stem": p.get("stem"),
+            "status": p.get("status"),
+            "reason_code": p.get("reason_code"),
+            "script": p.get("script"),
+            "candidates": list(p.get("candidates") or []),
+        }
+        for p in report.get("panels") or []
+    ]
+    return {
+        "summary": dict(report.get("summary") or {}),
+        "panels": panels,
+        "conflicts": report.get("conflicts"),
+    }
+
+
+def refresh_project(
+    *,
+    session_id: str | None = None,
+    project_path: str | None = None,
+    port: int | None = None,
+    http_status=None,
+) -> dict:
+    """`tavotto_refresh_project` 的实现：解析授权的项目 → 优先委托运行中的
+    Tavotto → 不可达再本地 → 结构化 diff + 就绪度摘要。
+
+    **不复制 discover、不 probe、不运行用户脚本**：两条路都落在
+    `engine/project_refresh.refresh_project_index()`（ADR 0025）。结果里没有
+    绝对路径：项目用短 id，脚本 / 图都是项目相对名。
+    """
+    project = resolve_refresh_project(session_id=session_id, project_path=project_path)
+    port = engine_handoff.DEFAULT_PORT if port is None else int(port)
+    http_status = engine_handoff.http_json_status if http_status is None else http_status
+
+    if _app_reachable(port, http_status):
+        result, readiness = _remote_refresh(port, project, http_status)
+        delivered = DELIVERED_APP
+    else:
+        result, readiness = _local_refresh(project)
+        delivered = DELIVERED_LOCAL
+
+    registry = dict(result.get("registry") or {})
+    assets = dict(result.get("assets") or {})
+    return {
+        "ok": True,
+        "project_id": project_id(project),
+        "reason": REFRESH_REASON,
+        "delivered": delivered,
+        "registry": {
+            k: registry.get(k)
+            for k in (
+                "added_scripts",
+                "removed_scripts",
+                "changed_scripts",
+                "script_changes",
+                "added_stems",
+                "removed_stems",
+                "moved_stems",
+                "conflicts",
+                "conflicts_changed",
+            )
+        },
+        "assets": {k: assets.get(k) for k in ("added", "removed", "changed", "baseline")},
+        "readiness": _compact_readiness(readiness),
+        "sessions": sorted(sid for sid, s in _SESSIONS.items() if s.project == project),
+    }
+
+
+# ------------------------------- 渲染 / 应用 ---------------------------------
+def _render(session: Session, patches: list, *, preview_dpi: int | None) -> dict:
+    worker = session.acquire()
+    try:
+        resp = worker.override(session.stem, patches, preview_dpi, inline_svg=True)
+    except engine_pool.WorkerError as exc:
+        raise BridgeError(
+            str(exc),
+            code=exc.code or "render_failed",
+            traceback=exc.traceback_text,
+            module=getattr(exc, "module", ""),
+        ) from exc
+    session.patches = list(patches)
+    session.manifest = resp["manifest"]
+    session.svg = resp.get("svg")
+    session.preview = resp.get("preview")
+    session.warnings = list(resp.get("warnings", []) or [])
+    # 上一版的位图属于上一组 patches；这一次不是 raster 档就没有位图可配对。
+    session.preview_png_base64 = None
+    session.preview_png_manifest = None
+    # 预检是 manifest 的函数，而 manifest 刚换了一份——哪怕 patches 没变（脚本改了、
+    # worker 重建、重开沿用会话），键对得上也不代表结论还对。缓存只活在两次渲染之间。
+    session.preflight_cache = None
+    session.apply_receipt = None
+    session.rev = getattr(worker, "rev", session.rev + 1)
+    session.last_used = time.time()
+    out = {
+        "manifest": session.manifest,
+        "svg": session.svg,
+        "patch_hash": session.patch_hash(),
+        "worker_generation": getattr(worker, "generation", None),
+        "render_revision": session.rev,
+        "warnings": session.warnings,
+        "timings": resp.get("timings", {}),
+    }
+    if session.preview is not None:
+        out["preview"] = session.preview
+    # raster 档下 `svg` 是 None，而**内嵌画布里没有可连的 HTTP 服务**——
+    # 不在同一次响应里把位图带上，Codex 那边的画布就整个空掉（ADR 0022
+    # 「不变量 5」：降级是换一种画法，不是不给画）。
+    #
+    # 与位图**同一次响应**也不只是省一跳：另开一个工具去取，取回来的可能已经
+    # 是另一组 patches 的像素——SVG 与 manifest 的原子配对纪律（web/AGENTS.md
+    # 「渲染态」①）在这里同样成立。
+    #
+    # 尺寸受控（`RASTER_PREVIEW_WIDTH_PX`）：绝不把 giant SVG 转成 base64
+    # 塞回来，那只是把同一个 payload 换个编码再放大三分之一。
+    if (session.preview or {}).get("mode") == previewbudget.MODE_RASTER:
+        try:
+            snapshot = getattr(worker, "preview_png_snapshot", None)
+            if snapshot is None:
+                # The plugin can run with older installed engines. Keep their
+                # pixels viewable, but do not label SVG geometry as a PNG pair.
+                out["preview_png_base64"] = preview_png(
+                    session, list(patches), previewbudget.RASTER_PREVIEW_WIDTH_PX
+                )
+                out["preview_png_error"] = "preview_geometry_unavailable"
+                session.warnings.append("升级 Tavotto 后可编辑此位图预览中的元素位置。")
+            else:
+                frame = snapshot(session.stem, list(patches), previewbudget.RASTER_PREVIEW_WIDTH_PX)
+                out["preview_png_base64"] = frame["png"]
+                out["preview_png_manifest"] = session.preview_png_manifest = frame["manifest"]
+            session.preview_png_base64 = out["preview_png_base64"]
+        except (BridgeError, engine_pool.WorkerError) as exc:
+            # 位图失败不该把这次**成功的渲染**变成一条错误：manifest 是对的、
+            # 编辑语义是完整的，缺的只是画面。如实回一个 code，别静默。
+            out["preview_png_error"] = exc.code or "preview_failed"
+    return out
+
+
+def _bounded_apply_receipt(out: dict) -> dict:
+    """只保存小份诊断；极端 rejected / timings 超限时保留计数并说清缺项。"""
+    receipt = {k: out[k] for k in APPLY_RECEIPT_KEYS if k in out}
+    receipt.update(warning_count=len(out["warnings"]), rejected_count=len(out["rejected"]))
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+    # 流式量字节，避免为了测巨大 rejected 另造一个完整 JSON 字符串。
+    for key in ("rejected", "timings", "preview_png_error", None):
+        size = 0
+        for chunk in encoder.iterencode(receipt):
+            size += len(chunk.encode("utf-8"))
+            if size > APPLY_RECEIPT_BUDGET_BYTES:
+                break
+        if size <= APPLY_RECEIPT_BUDGET_BYTES:
+            return receipt
+        if key is not None and key in receipt:
+            del receipt[key]
+            receipt.setdefault("diagnostics_unavailable", []).append(key)
+    # 固定把手来自会话/worker，不含图中文字与无界诊断。
+    raise AssertionError("apply receipt handle exceeded its budget")
+
+
+def apply_overrides(
+    session_id: str,
+    patches: object,
+    *,
+    preview_dpi: int | None = None,
+    user_authorized: bool = False,
+) -> dict:
+    """应用**全量** override 列表并重渲染。
+
+    「全量列表」是 Tavotto 的 override 语义：worker 维护 applied/originals 两表，
+    列表里没有的 key 自动恢复原值。**别发增量补丁**——那样撤销就没有基准了。
+
+    脏条目不静默丢：`patchspec.canonicalize_with_diagnostics` 把它们连同原因
+    一起交出来，随响应回给 Codex（`rejected`）。发给 worker 的是**过滤后仍保持
+    原始顺序**的那份，与 Flask `/api/engine/render` 走的完全一样。
+
+    **会话上有规范化合同时（ADR 0051）**：只有「与已提交的那份逐条相同」的列表
+    直接放行（画布 / 调用方原样重发）；任何增删改都要 `user_authorized=True`——
+    那是「用户明确提出了新要求」的声明，合同随之解除、验收报告作废。没有它就回
+    `requires_authorization`，列出差异，**不改任何东西**。这挡的是修复循环 / 模型
+    自己扩权，也挡住画布账本没带着规范化 patch 时把它静默还原。
+    """
+    session = get_session(session_id)
+    canonical, dropped = patchspec.canonicalize_with_diagnostics(patches)
+    if dropped and any(d["index"] == -1 for d in dropped):
+        raise BridgeError("patches 必须是数组", code="bad_patches", rejected=dropped)
+    bad = {d["index"] for d in dropped}
+    clean = [p for i, p in enumerate(patches or []) if i not in bad]
+
+    released = False
+    if session.contract is not None:
+        diff = _contract_diff(session, clean)
+        if diff and not user_authorized:
+            raise BridgeError(
+                "这个会话已按修改约定完成规范化：改动超出约定范围（或会撤掉规范化的编辑）。"
+                "要改，请在用户明确提出新要求后带 user_authorized=true 再调（合同解除、"
+                "验收报告作废）；只是想再规范化一次，调 tavotto_normalize_figure。",
+                code=engine_normalize.EXIT_REQUIRES_AUTHORIZATION,
+                contract_id=session.contract["contract_id"],
+                violations=diff,
+                allowed=session.contract["allowed"],
+                allowed_adjust=session.contract["allowed_adjust"],
+            )
+        if diff and user_authorized:
+            released = True
+
+    out = _render(session, clean, preview_dpi=preview_dpi)
+    if released:
+        # 明确要求之下解除合同：验收报告随之作废（它验的是另一个状态）
+        session.contract = None
+        session.normalized = None
+    if (
+        session.normalized is not None
+        and session.normalized.get("patch_hash") != session.patch_hash()
+    ):
+        session.normalized["stale"] = True
+    _persist(session)
+    out.update(
+        {
+            "ok": True,
+            "session_id": session.id,
+            "stem": session.stem,
+            "restored": _take_restored(session),
+            "applied": len(clean),
+            "rejected": dropped,
+            "canonical_patch_count": len(canonical),
+            "contract_released": released,
+        }
+    )
+    session.apply_receipt = _bounded_apply_receipt(out)
+    return out
+
+
+def _take_restored(session: Session) -> bool:
+    """这次调用里会话是不是刚从落盘记录重建的；读一次就清掉。"""
+    was, session.restored = session.restored, False
+    return was
+
+
+def _contract_diff(session: Session, patches: list) -> list[dict]:
+    """与已提交的规范化 patch 列表逐条比：多出 / 少掉 / 改值的键。空 = 原样重发。"""
+    want = {(str(p["gid"]), str(p["prop"])): p["value"] for p in session.patches}
+    got = {(str(p["gid"]), str(p["prop"])): p["value"] for p in patches}
+    diff = []
+    for key in sorted(set(want) | set(got)):
+        if key not in got:
+            diff.append({"gid": key[0], "prop": key[1], "change": "dropped", "value": want[key]})
+        elif key not in want:
+            diff.append({"gid": key[0], "prop": key[1], "change": "added", "value": got[key]})
+        elif not engine_normalize._same(want[key], got[key]):
+            diff.append(
+                {
+                    "gid": key[0],
+                    "prop": key[1],
+                    "change": "changed",
+                    "before": want[key],
+                    "after": got[key],
+                }
+            )
+    return diff
+
+
+def session_state(session_id: str) -> dict:
+    """会话**此刻**的完整快照——manifest / SVG / 位图 / patches——**不重渲染**。
+
+    这是内嵌画布的取件通道（issue #457）：`tavotto_open_figure` 的工具结果会进
+    宿主的模型上下文、rollout 与 UI 事件三条路，Codex 把最后那条封顶在 1 MiB，
+    超过就把 `structuredContent` 整个置空（`server.HOST_EVENT_RESULT_CAP_BYTES`）。
+    画布自己发的 `tools/call` 走的是宿主直接代理的那条路，不进模型上下文也不
+    截断，所以大图的负载从这里取，open 的结果里只留一个够画布认出会话的把手。
+
+    全部字段都来自会话对象上最近一次 `_render` 留下的东西：manifest 与 svg /
+    位图**同一次响应**（ADR 0022 不变量 5）；`patches` 是它们对应的那一组——
+    画布必须用它来 seed 账本，否则下一次编辑会把模型已经应用的修改静默还原。
+    """
+    session = get_session(session_id)
+    if session.manifest is None:
+        raise BridgeError(
+            "会话还没有 manifest（先 apply 一次 override 或重新 open）", code="no_manifest"
+        )
+    out = {
+        "ok": True,
+        "session_id": session.id,
+        "project": session.project,
+        "stem": session.stem,
+        "script": session.script,
+        "entry": session.entry,
+        "cost": session.cost,
+        "profile": engine_profiles.stamp(session.profile),
+        "patches": list(session.patches),
+        "patch_hash": session.patch_hash(),
+        "render_revision": session.rev,
+        "manifest": session.manifest,
+        "svg": session.svg,
+        "warnings": list(session.warnings),
+        "restored": _take_restored(session),
+    }
+    if session.apply_receipt is not None:
+        out["last_apply"] = session.apply_receipt
+    if session.preview is not None:
+        out["preview"] = session.preview
+    if session.preview_png_base64 is not None:
+        out["preview_png_base64"] = session.preview_png_base64
+        out["preview_png_manifest"] = session.preview_png_manifest
+    return out
+
+
+def preview_png(session: Session, patches: list, width_px: int) -> str:
+    """按 patches 出一张高清位图（base64）。**状态中立**：worker 出完就还原。"""
+    tag = "v" + patchspec.patch_hash(patches).split(":")[-1][:12]
+    worker = session.acquire()
+    try:
+        path = worker.preview_png(session.stem, patches, int(width_px), tag=tag)
+    except engine_pool.WorkerError as exc:
+        raise BridgeError(
+            str(exc), code=exc.code or "preview_failed", traceback=exc.traceback_text
+        ) from exc
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        # worker 说成了、文件却读不出来（被杀毒隔离、磁盘满、缓存目录被清）。
+        # 这一步以前在 try 之外，裸 OSError 会绕过所有 BridgeError 处理——
+        # `open_figure` 的降级也就接不住它，那条刚登记的会话又变回谁也够不着
+        # 的幽灵。**这个函数对外只许抛 BridgeError**。
+        raise BridgeError(f"位图出来了却读不出来 {path}: {exc}", code="preview_unreadable") from exc
+    return base64.b64encode(data).decode("ascii")
+
+
+# -------------------------------- 预检 --------------------------------------
+def resolve_profile(session: Session, profile_id: str | None, journal: dict | None) -> dict:
+    if profile_id is None and journal is None:
+        return session.profile
+    try:
+        return engine_profilestore.resolve_spec(
+            profile_id or session.profile["profile_id"], journal
+        )
+    except (engine_profiles.ProfileError, engine_profilestore.ProfileStoreError) as exc:
+        raise BridgeError(str(exc), code="unknown_profile") from exc
+
+
+def export_raster_issues(profile: dict, formats: list[str] | None, dpi: int | None) -> list[dict]:
+    """「这次导出请求本身」带来的检查项：位图格式的 dpi 够不够规范。
+
+    `engine/preflight.py` 的 `raster-dpi` 判的是**面板素材**的等效分辨率
+    （画布那条入口有 px_w，MCP 这条没有）；这里判的是「现在就按这个 dpi 出
+    一张图」。判据是同一条规范，所以**复用同一个 id 与同一张 severity 表**
+    ——另起一个 code 的话，期刊覆盖里把 `raster-dpi` 调成 warn 对导出这条路
+    就不生效了，同一份规范在两条入口上说不同的话。
+    """
+    if not formats or dpi is None:
+        return []
+    raster = {
+        str(f).lower() for f in ((profile.get("preferred_formats") or {}).get("raster") or ())
+    }
+    hit = [f for f in formats if f in raster]
+    if not hit:
+        return []
+    try:
+        min_dpi, got = float(profile.get("min_raster_dpi") or 0), float(dpi)
+    except (TypeError, ValueError):
+        return []
+    if not min_dpi or got >= min_dpi:
+        return []
+    return [
+        {
+            "id": "raster-dpi",
+            "severity": engine_profiles.severity_of(profile, "raster-dpi"),
+            "text": f"导出 {'/'.join(hit)} 用的 {got:g}dpi 低于规范的 {min_dpi:g}dpi",
+            # issue #30：widget 按自己的 locale 渲染，key 登记在前端
+            # errors:preflight.exportRasterDpi（i18n:check 看护双语齐全）
+            "message": {
+                "key": "exportRasterDpi",
+                "params": {"formats": "/".join(hit), "dpi": f"{got:g}", "min": f"{min_dpi:g}"},
+            },
+            "object_ids": [],
+            "gids": [],
+            "detail": {"dpi": got, "min_dpi": min_dpi, "formats": hit},
+        }
+    ]
+
+
+def run_preflight(
+    session_id: str,
+    *,
+    profile_id: str | None = None,
+    journal: dict | None = None,
+    export_formats: list[str] | None = None,
+    export_dpi: int | None = None,
+) -> dict:
+    session = get_session(session_id)
+    if session.manifest is None:
+        raise BridgeError(
+            "会话还没有 manifest（先 apply 一次 override 或重新 open）", code="no_manifest"
+        )
+    profile = resolve_profile(session, profile_id, journal)
+    spec = engine_preflight.spec_from_manifest(
+        session.manifest, panel_id=session.stem, kind="pdf", scale=1.0
+    )
+    issues = engine_preflight.run(spec, profile)
+    issues += export_raster_issues(profile, export_formats, export_dpi)
+    # 真实渲染几何上的干涉（文字重叠 / 压到别的子图 / 图例压数据）：与规范求值器
+    # 分开是因为它量的是「画出来撞没撞上」，不是「该长什么样」；形状同一份，
+    # 进同一份报告（ADR 0051）。
+    issues += engine_interference.detect(session.manifest, profile, panel_id=session.stem)
+    summary = engine_preflight.summarize(issues)
+    # 匿名用量统计：**结果算完之后**记一次，且只记四个计数 + 一个布尔。
+    # 检查项的文案、字体名、gid、对象 id、stem 一个都不发（白名单里没有这些
+    # 属性）。没同意 / 硬开关关着时这一行什么都不做。画布那一侧的预检由前端
+    # 的求值器记（两个求值器的分工见 CLAUDE.md），两条入口对应两种用户流程。
+    counts = summary["counts"]
+    engine_telemetry.capture(
+        "preflight_completed",
+        {
+            "errors": min(counts.get("error", 0), 1000),
+            "warnings": min(counts.get("warn", 0), 1000),
+            "not_verifiable": min(counts.get("not_verifiable", 0), 1000),
+            "suggestions": min(counts.get("suggestion", 0), 1000),
+            "passed": not counts.get("error", 0) and not counts.get("warn", 0),
+        },
+    )
+    out = {
+        "ok": True,
+        "session_id": session.id,
+        "stem": session.stem,
+        "profile": engine_profiles.stamp(profile),
+        "size_mm": session.manifest.get("size_mm"),
+        "patch_hash": session.patch_hash(),
+        "errors": summary["errors"],
+        "warnings": summary["warnings"],
+        "not_verifiable": summary["not_verifiable"],
+        "suggestions": summary["suggestions"],
+        "counts": summary["counts"],
+        "blocking": summary["blocking"],
+        # 「要用户点头」≠「有阻断项」：`not_verifiable` 按定义查不了
+        # （位图内部的文字），规范要求人工确认并写进 proof。导出对话框一直是
+        # 这么判的（`needsConfirm = errors || notVerifiable`），MCP 这条入口
+        # 只看 error，于是同一份图在两条路上给出不同的放行结论。
+        "needs_confirm": bool(summary["blocking"] or summary["not_verifiable"]),
+        "report": format_preflight(session, profile, issues, summary),
+    }
+    if profile_id is None and journal is None and not export_formats and export_dpi is None:
+        # 默认参数那一档缓存到会话上：open 刚算过一遍，画布随后经
+        # `session_state()` 取快照时不必再等一次（大图的预检是十秒级）。
+        # 键 = patch_hash + profile 印章，两者任一变了就作废（见 Session 注释）。
+        session.preflight_cache = out
+    return out
+
+
+def cached_preflight(session: Session) -> dict | None:
+    """会话上还**对得上**的默认预检结果；对不上或没有就 None。"""
+    cached = session.preflight_cache
+    if not cached:
+        return None
+    if cached.get("patch_hash") != session.patch_hash():
+        return None
+    if cached.get("profile") != engine_profiles.stamp(session.profile):
+        return None
+    return cached
+
+
+def format_preflight(session: Session, profile: dict, issues: list[dict], summary: dict) -> str:
+    """人类可读的那一份（Codex 会把它念给用户听）。"""
+    head = (
+        f"《{profile.get('label', profile['profile_id'])}》 v{profile['version']} · {session.stem}"
+    )
+    size = session.manifest.get("size_mm") if session.manifest else None
+    lines = [head]
+    if size:
+        lines.append(f"尺寸 {size[0]}×{size[1]} mm")
+    if not issues:
+        lines.append("✓ 全部通过")
+        return "\n".join(lines)
+    label = {
+        "error": "✗ 阻断",
+        "warn": "! 警告",
+        "not_verifiable": "? 无法核验",
+        "suggestion": "· 建议",
+    }
+    for level in ("error", "warn", "not_verifiable", "suggestion"):
+        group = [i for i in issues if i["severity"] == level]
+        if not group:
+            continue
+        lines.append("")
+        lines.append(f"{label[level]}（{len(group)}）")
+        for issue in group:
+            where = "、".join(issue["gids"][:4]) or "、".join(issue["object_ids"][:4])
+            lines.append(f"  - {issue['text']}" + (f"  [{where}]" if where else ""))
+    if summary["blocking"]:
+        lines.append("")
+        lines.append(
+            "有阻断项：tavotto_export 会拒绝导出，除非用户明确要求（explicit_confirm=true）。"
+        )
+    return "\n".join(lines)
+
+
+# -------------------------------- 导出 --------------------------------------
+def export(
+    session_id: str,
+    *,
+    formats: list[str],
+    dpi: int = 600,
+    stem: str | None = None,
+    out_dir: str | None = None,
+    profile_id: str | None = None,
+    journal: dict | None = None,
+    explicit_confirm: bool = False,
+    proof: bool = True,
+    acceptance: dict | None = None,
+) -> dict:
+    """先预检，再导出。**有阻断项且没有明确确认时一张图都不出。**
+
+    「这次导出要什么」与「怎么把它变成磁盘上的文件」**都不在这里实现**
+    （issue #224）：请求走 `engine/exportreq.py` 的 `ExportRequest`（文件名
+    清洗、扩展名、留档后缀、格式枚举、PPI 语义只有那一份），落盘走
+    `engine/exportjob.py` 的作业生命周期（临时目录 → 全部产出完成 → 逐个
+    原子 `os.replace`；一个格式挂了进 `partial`，而不是把半套文件留在最终
+    目录里；取消与残留临时目录由同一个模块清）。ADR 0031 里「codex-plugin
+    一行不用改」说的是**回执形状**，不是给第二份实现的豁免。
+
+    回执形状原样保留：`files[]`（含 `path`）/ `export_dir` / `proof_path` /
+    `warnings` / `patch_hash` / `profile` / `preflight` / `forced` /
+    `acknowledged`。新增的只有诚实所需的两项——作业终局 `status`，以及失败
+    那一项自己带的 `error`。
+
+    **有限产物验证**（ADR 0068）：每个封口的临时文件在提交点之前重新打开量
+    事实（`engine/artifactinspect.py`——与 HTTP 导出**同一份**接线，不是第二份
+    检查器），`files[].manifest` 原样带出 `verdict / checks / notes / sha256`；
+    四值判据里 `unknown` 不是 `verified`，模型读回执时不得把「未核验」转述成
+    「已通过」。这条入口只有 standard 政策（必需 = 完整性 + 核心尺寸，不合格的
+    那一项以 `artifact_rejected` 进 `partial`、不发布）；严格政策走 HTTP 导出
+    的 `inspection` 段。
+
+    `acceptance`（ADR 0051）：规范化事务给的**最终产物验收参数**
+    `{"expect_mm": [w, h], "font_family": str|None, "contract_id": str}`。给了它，
+    每个格式在**临时目录里**就按格式验尺寸 / 字体（`engine/artifactcheck.py`），
+    验不过的那一项以 `acceptance_failed` 进 `partial`，**不发布**——磁盘上不会
+    出现一个看起来成功的坏文件。回执多一项 `acceptance`（逐格式的核验结果）。
+    没有合同的普通导出在会话带着已验收的规范化状态时也做同一份核验（`normalized`
+    字段说明验收报告是否仍对得上当前状态）。
+    """
+    session = get_session(session_id)
+    fmts = [f.lower().strip() for f in (formats or []) if str(f).strip()]
+    bad = [f for f in fmts if f not in EXPORT_FORMATS]
+    if bad:
+        raise BridgeError(
+            f"不支持的导出格式: {', '.join(bad)}（支持 {', '.join(EXPORT_FORMATS)}）",
+            code="bad_format",
+        )
+    # 默认格式取**这次调用的** profile，不是会话打开时那份：调用方带了
+    # `profile_id` 或期刊覆盖时，预检与 proof 盖的都是新 profile 的章，
+    # 而格式却还按旧的来——一份说「默认出 SVG」的覆盖会静默出成 PDF+PNG。
+    call_profile = resolve_profile(session, profile_id, journal)
+    if not fmts:
+        fmts = list(call_profile["preferred_formats"]["export_default"])
+    try:
+        dpi = int(dpi)
+    except (TypeError, ValueError):
+        raise BridgeError(f"dpi 必须是整数: {dpi!r}", code="bad_dpi") from None
+    if dpi <= 0:
+        raise BridgeError(f"dpi 必须为正: {dpi}", code="bad_dpi")
+
+    checks = run_preflight(
+        session.id, profile_id=profile_id, journal=journal, export_formats=fmts, export_dpi=dpi
+    )
+    if checks["needs_confirm"] and not explicit_confirm:
+        raise BridgeError(
+            f"预检有 {len(checks['errors'])} 类阻断性问题、"
+            f"{len(checks['not_verifiable'])} 类无法核验项，未导出。"
+            "修好它们，或者在用户明确要求后带 explicit_confirm=true 再调一次。",
+            code="preflight_blocked",
+            preflight=checks,
+        )
+
+    if out_dir:
+        target_dir = Path(check_scope(out_dir))
+    else:
+        # 项目设置里的 `export_dir` 可以是任意绝对路径（桌面版下完全合法），
+        # 但 MCP 这条入口的边界是 `TAVOTTO_MCP_ROOTS`。默认值不过尺的话，
+        # 一个对桌面版有效的项目就能让导出落到范围之外——而调用方**显式**
+        # 传同一个路径反而会被拒。边界只有一条，默认值也得走它。
+        target_dir = Path(check_scope(str(engine_config.project_export_dir(session.project))))
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    forced = bool(checks["blocking"] and explicit_confirm)
+    acknowledged = (
+        [i["id"] for i in checks["errors"]] + [i["id"] for i in checks["not_verifiable"]]
+        if (checks["needs_confirm"] and explicit_confirm)
+        else []
+    )
+    size_mm = (session.manifest or {}).get("size_mm") or [None, None]
+
+    # **没有 `filename` = 旧契约**：`normalize()` 把它抬成同一个作业，名字仍是
+    # `<stem>_<MMDD_HHMMSS>.<ext>`、留档仍是 `…_proof.json`（ADR 0031 §5 明写
+    # 旧契约一个字节不变）。变的是**由谁**拼这个名字：清洗规则从这里搬走了。
+    # `scope=original` 是如实描述——这条入口导的就是那一张图自己，画布上的
+    # 落位与缩放在这里根本不存在（`OriginalSource` 上就没有 x/y/w/h）。
+    spec = {
+        "scope": engine_exportreq.SCOPE_ORIGINAL,
+        "formats": fmts,
+        "stem": stem or session.stem,
+        "dpi": dpi,
+        "proof": bool(proof),
+        "original": {
+            "figure_id": session.stem,
+            "overrides": session.patches,
+            "source_kind": "figure",
+            "w_mm": size_mm[0],
+            "h_mm": size_mm[1],
+        },
+    }
+    try:
+        job = engine_exportjob.prepare(spec, target_dir, allowed_formats=EXPORT_FORMATS)
+    except engine_exportreq.ExportRequestError as exc:
+        raise BridgeError(exc.message, code=exc.code, params=exc.params) from exc
+    # 上一次进程被 kill 时留下的临时目录顺手扫掉（只认本模块的前缀）
+    engine_exportjob.sweep_stale_tmp_dirs(target_dir)
+
+    worker = session.acquire()
+    failures: dict[str, engine_pool.WorkerError] = {}
+    # 会话带着仍然有效的规范化验收时，普通导出也按同一份参数核验产物
+    if (
+        acceptance is None
+        and session.normalized is not None
+        and not session.normalized.get("stale")
+    ):
+        acceptance = dict(session.normalized.get("acceptance_params") or {})
+    checks_by_fmt: dict[str, dict] = {}
+
+    def _produce(job, tmp_dir: Path) -> list:
+        produced = []
+        for fmt in job.request.formats:
+            job.check_cancelled()
+            tmp = tmp_dir / f"{job.id}.{fmt}"
+            try:
+                resp = worker.export(session.stem, session.patches, str(tmp), fmt, dpi)
+            except engine_pool.WorkerError as exc:
+                # 一个格式挂了，不该让另一个已经渲染好的成果跟着丢，更不该把
+                # 半套文件留在最终目录里：失败的那一项带自己的 code 进
+                # `partial`（ADR 0031 §4「部分失败可见」）
+                failures[fmt] = exc
+                produced.append(
+                    engine_exportjob.Produced(
+                        format=fmt,
+                        error_code=exc.code or "export_failed",
+                        error_params={"error": str(exc), "format": fmt},
+                    )
+                )
+                continue
+            for w in resp.get("warnings") or []:
+                if w not in job.warnings:
+                    job.warnings.append(w)
+            if acceptance is not None:
+                # **验的是临时目录里那个文件本身**（不是 figsize、不是预览）：
+                # 不过就不发布，回执里那一项带 `acceptance_failed`
+                check = engine_artifactcheck.check_file(
+                    tmp,
+                    fmt,
+                    expect_mm=acceptance.get("expect_mm"),
+                    dpi=dpi if fmt in engine_exportreq.RASTER_FORMATS else None,
+                    font_family=acceptance.get("font_family"),
+                )
+                checks_by_fmt[fmt] = check
+                if not check["ok"]:
+                    produced.append(
+                        engine_exportjob.Produced(
+                            format=fmt,
+                            error_code="acceptance_failed",
+                            error_params={"format": fmt, "failed": check["failed"], "check": check},
+                        )
+                    )
+                    continue
+            raster = fmt in engine_exportreq.RASTER_FORMATS and size_mm[0] and size_mm[1]
+            # 来源与四身份（U09，ADR 0070）：这条路是 worker 直接序列化、没有 RenderPlan，回执 / 源产物 /
+            # 语义与 render 身份由 `artifactinspect.execution_provenance` 按与 HTTP 候选路同一份算法补进
+            # 计划半张；算不出来（老 worker）就没有这一段，manifest 的身份如实是 None
+            try:
+                provenance = engine_artifactinspect.execution_provenance(
+                    job,
+                    worker,
+                    script=session.script,
+                    source_id=engine_figcapture.runtime_asset_id(session.script, session.stem),
+                    patch_hash=session.patch_hash(),
+                    tmp_path=tmp,
+                    kind=fmt,
+                )
+            except Exception as exc:  # noqa: BLE001 —— 来源段算不出不影响导出本身，但要说出口
+                provenance = None
+                note = f"{fmt}: 来源 / 回执段装配失败（{type(exc).__name__}），产物身份未核验"
+                if note not in job.warnings:
+                    job.warnings.append(note)
+            produced.append(
+                engine_exportjob.Produced(
+                    format=fmt,
+                    tmp_path=tmp,
+                    width_mm=size_mm[0],
+                    height_mm=size_mm[1],
+                    # 位图的期望像素 = 图幅 × dpi（与 artifactcheck 同一换算）：产物检查按它核
+                    # 文件里的像素数，不给的话 `size` 那一维只能 unknown
+                    width_px=int(round(size_mm[0] / 25.4 * dpi)) if raster else None,
+                    height_px=int(round(size_mm[1] / 25.4 * dpi)) if raster else None,
+                    # PDF/SVG/EPS 是 matplotlib 直接序列化的真矢量；PNG/TIFF 才吃 dpi
+                    vector=fmt in engine_exportreq.VECTOR_FORMATS,
+                    manifest={"provenance": provenance} if provenance else None,
+                )
+            )
+        return produced
+
+    def _inspect(job, produced: list) -> list:
+        # 与 `app.py` 的 HTTP 导出同一份接线：`backend` 只是计划半张里「谁写的」；
+        # 没有 pikepdf 时 PDF 经契约层 probe 做基本观测，所以按需 import、不进桥的
+        # 常驻 import 闭包
+        return engine_artifactinspect.inspect_produced(
+            job, produced, backend="worker", probe=_probe_asset
+        )
+
+    def _report(job, outputs: list) -> bytes:
+        return _proof_bytes(
+            session,
+            checks,
+            [
+                str(target_dir / o.name)
+                for o in outputs
+                if o.status == engine_exportjob.STATUS_DONE and o.name
+            ],
+            dpi,
+            list(job.request.formats),
+            forced=forced,
+            acknowledged=acknowledged,
+            normalize=_normalize_proof_section(session, acceptance, checks_by_fmt),
+        )
+
+    engine_exportjob.run(job, _produce, report=_report if proof else None, inspect=_inspect)
+
+    if job.status == engine_exportjob.STATUS_CONFLICT:
+        raise BridgeError(
+            f"导出目录里这几个名字正被另一次导出占用：{'、'.join(job.conflicts)}",
+            code="export_conflict",
+            conflicts=list(job.conflicts),
+        )
+    if job.status == engine_exportjob.STATUS_FAILED:
+        code = job.error_code or "export_failed"
+        first = next((failures[f] for f in fmts if f in failures), None)
+        raise BridgeError(
+            job.error_params.get("error") or f"导出失败（{code}）",
+            code=code,
+            traceback=first.traceback_text if first is not None else None,
+        )
+
+    files = []
+    for o in job.outputs:
+        entry = {
+            "format": o.format,
+            "path": str(target_dir / o.name) if o.name else None,
+            "bytes": o.bytes or 0,
+            # PDF/SVG/EPS 是 matplotlib 直接序列化的真矢量；PNG/TIFF 才吃 dpi
+            "vector": o.vector,
+            "dpi": job.request.ppi if o.format in engine_exportreq.RASTER_FORMATS else None,
+            "status": o.status,
+        }
+        if o.error_code:
+            entry["error"] = {"code": o.error_code, "params": o.error_params}
+        if o.manifest is not None:
+            entry["manifest"] = o.manifest
+        files.append(entry)
+
+    result = {
+        "ok": job.status == engine_exportjob.STATUS_DONE,
+        # `partial` 是**独立一档**：并进 `done` 或 `failed` 都会说谎，
+        # 只是方向相反（ADR 0031 §4）
+        "status": job.status,
+        "session_id": session.id,
+        "stem": session.stem,
+        "export_dir": str(target_dir),
+        "files": files,
+        "patch_hash": session.patch_hash(),
+        "profile": checks["profile"],
+        "warnings": list(job.warnings),
+        "preflight": {
+            k: checks[k]
+            for k in (
+                "counts",
+                "blocking",
+                "needs_confirm",
+                "errors",
+                "warnings",
+                "not_verifiable",
+                "suggestions",
+            )
+        },
+        # `forced` 只说「有 error 却还是出了」；无法核验项要的是确认、
+        # 不是强制，两件事在留档里必须分得开
+        "forced": forced,
+        "acknowledged": acknowledged,
+        "normalized": _normalized_status(session),
+    }
+    if checks_by_fmt:
+        result["acceptance"] = checks_by_fmt
+    if job.report is not None:
+        if job.report.status == engine_exportjob.STATUS_DONE and job.report.name:
+            result["proof_path"] = str(target_dir / job.report.name)
+        else:
+            # 要了留档却没写成，**不静默跳过**：作业已经因此进了 `partial`，
+            # 回执里也得说出是哪一条（ADR 0031 §7 的同一条）
+            result["proof_error"] = {
+                "code": job.report.error_code,
+                "params": job.report.error_params,
+            }
+    return result
+
+
+def _probe_asset(path: Path, kind: str) -> dict:
+    """契约层的 `probe_asset`，按需 import：产物检查在没有 pikepdf 的机器上用它做 PDF 基本观测。"""
+    from tavotto import pdfbackend
+
+    return pdfbackend.probe_asset(path, kind)
+
+
+def _normalized_status(session: Session) -> dict | None:
+    """导出回执里「这次导的是不是通过验收的规范化状态」：没做过规范化回 None。"""
+    n = session.normalized
+    if n is None:
+        return None
+    current = session.patch_hash() == n.get("patch_hash") and not n.get("stale")
+    return {
+        "contract_id": n.get("contract_id"),
+        "verified": bool(current),
+        "reason": None if current else "state_changed",
+        "verified_patch_hash": n.get("patch_hash"),
+    }
+
+
+def _normalize_proof_section(
+    session: Session, acceptance: dict | None, checks: dict
+) -> dict | None:
+    status = _normalized_status(session)
+    if status is None and acceptance is None:
+        return None
+    return {
+        **(status or {}),
+        "acceptance_params": dict(acceptance or {}),
+        "artifact_checks": dict(checks),
+    }
+
+
+def _proof_bytes(
+    session: Session,
+    checks: dict,
+    paths: list[str],
+    dpi: int,
+    formats: list[str],
+    *,
+    forced: bool,
+    acknowledged: list[str],
+    normalize: dict | None = None,
+) -> bytes:
+    """proof report：profile 身份 + 全部检查结果 + 无法核验项 + 是否强制导出。
+
+    与画布导出的 proof 同一个 kind/version（`web/src/lib/preflight.ts` 的
+    `buildProofPayload`）——两条入口出的留档得能放在一起看。
+
+    **只回字节**：它叫什么、写到哪、撞了名怎么办由 `exportjob._plan_names()`
+    决定。报告和图一样是会被写进最终目录的产物，名字的规则不能在这里再写一遍
+    （ADR 0031 §7b 第 2 条正是踩过的那个坑）。
+    """
+    from tavotto.engine.brand import PROOF_KIND  # 品牌常量唯一出处
+
+    payload = {
+        "kind": PROOF_KIND,
+        "version": 2,
+        "source": "codex-mcp",
+        "stem": session.stem,
+        "project": session.project,
+        "script": session.script,
+        "profile": checks["profile"],
+        "page_mm": {
+            "w": (session.manifest or {}).get("size_mm", [0, 0])[0],
+            "h": (session.manifest or {}).get("size_mm", [0, 0])[1],
+            "margin": 0,
+        },
+        "dpi": dpi,
+        "formats": formats,
+        "patch_hash": session.patch_hash(),
+        "patches": session.patches,
+        "checks": [
+            {
+                "id": i["id"],
+                "severity": i["severity"],
+                "text": i["text"],
+                "count": len(i["object_ids"]),
+                "object_ids": i["object_ids"],
+                "gids": i["gids"],
+                "detail": i["detail"],
+            }
+            for level in ("errors", "warnings", "not_verifiable", "suggestions")
+            for i in checks[level]
+        ],
+        "check_counts": checks["counts"],
+        "not_verifiable": [
+            {"id": i["id"], "text": i["text"], "object_ids": i["object_ids"]}
+            for i in checks["not_verifiable"]
+        ],
+        "forced": forced,
+        "acknowledged": acknowledged,
+        "files": paths,
+        "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if normalize is not None:
+        payload["normalize"] = normalize
+    return json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+# --------------------- 保留式规范化事务（ADR 0051） ---------------------------
+def _profile_issues(session: Session, profile: dict) -> list[dict]:
+    spec = engine_preflight.spec_from_manifest(
+        session.manifest, panel_id=session.stem, kind="pdf", scale=1.0
+    )
+    return engine_preflight.run(spec, profile)
+
+
+def _original_artifact_facts(session: Session) -> dict:
+    """B0 的证据之一：用户磁盘上的原始产物与脚本重跑出来的 live 图对不对得上。
+
+    对不上（ADR 0098 起 tight 存盘的图按原件的裁切框出图，不再因此对不上；还会对不上的是原件出自
+    别的机器 / 别的 matplotlib，或脚本在存盘之后改过）
+    时**不替换原件、不改脚本、不猜谁更权威**，只把两个尺寸都记下来，报告里说出口。
+    """
+    rel = engine_figcapture.find_original_artifact(session.project, session.stem)
+    out: dict = {"path": rel, "size_mm": None, "mismatch": None}
+    if rel is None:
+        return out
+    path = Path(session.project) / rel
+    live = (session.manifest or {}).get("size_mm") or [None, None]
+    try:
+        if path.suffix.lower() == ".pdf":
+            from tavotto import pdfbackend
+
+            probe = pdfbackend.probe_asset(path, "pdf")
+            size = [probe["w_pt"] / 72.0 * 25.4, probe["h_pt"] / 72.0 * 25.4]
+            out["size_mm"] = [round(size[0], 3), round(size[1], 3)]
+            if live[0] is not None:
+                out["mismatch"] = (
+                    abs(size[0] - float(live[0])) > 0.5 or abs(size[1] - float(live[1])) > 0.5
+                )
+    except Exception as exc:  # noqa: BLE001 — 原件读不出来不是事务的失败，如实记下
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _script_sha256(session: Session) -> str | None:
+    try:
+        data = (Path(session.project) / session.script).read_bytes()
+    except OSError:
+        return None
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _better(new: dict, old: dict) -> bool:
+    """一个修复候选比上一版更好（判据唯一出处 `normalize.better_candidate`）。"""
+    return engine_normalize.better_candidate(new, old)
+
+
+def normalize_figure(session_id: str, **kwargs) -> dict:
+    """`_normalize_figure` 的提交点：无论提交、回退还是异常回退，事务收尾后会话
+    **此刻**的状态（patches + 合同）落盘一次（ADR 0078）。事务中途的候选状态不落盘。"""
+    try:
+        return _normalize_figure(session_id, **kwargs)
+    finally:
+        session = _SESSIONS.get(session_id)
+        if session is not None:
+            _persist(session)
+
+
+def _normalize_figure(
+    session_id: str,
+    *,
+    targets: dict,
+    formats: list[str] | None = None,
+    dpi: int = 600,
+    stem: str | None = None,
+    out_dir: str | None = None,
+    profile_id: str | None = None,
+    journal: dict | None = None,
+    replay_check: bool = False,
+    evidence: bool = False,
+) -> dict:
+    """保留式规范化：B0 → 约定 → 最小编辑 → 真实渲染检测 → 有界局部修复 → 导出验收 → 提交或回退。
+
+    整条事务跑在**这个会话的热 worker**上，候选状态经 `_render`（全量列表语义）
+    落下、验不过就用 B0 的那份列表再 `_render` 一次——worker 的 applied/originals
+    两表随之回到事务开始前的状态（ADR 0003 的还原语义），manifest / patch_hash
+    也一起回到 B0。任何异常（含 KeyboardInterrupt）都走这条回退。
+
+    成功的判据是四件事同时成立（ADR 0051 §8）：目标达成且无未授权变更；没有新增 /
+    加重的确定性干涉或裁切；局部调整在预算内；**最终文件本身**过验收。少一条就
+    退出，会话仍是 B0，并说清冲突、试过的合法调整、需要放宽的最小约束。
+    """
+    session = get_session(session_id)
+    if session.manifest is None:
+        raise BridgeError("会话还没有 manifest（先重新 open）", code="no_manifest")
+    try:
+        want = engine_normalize.normalize_targets(targets)
+    except engine_normalize.NormalizeError as exc:
+        raise BridgeError(str(exc), code=exc.code, **exc.extra) from exc
+    profile = resolve_profile(session, profile_id, journal)
+    fmts = [f.lower().strip() for f in (formats or []) if str(f).strip()]
+    bad = [f for f in fmts if f not in EXPORT_FORMATS]
+    if bad:
+        raise BridgeError(
+            f"不支持的导出格式: {', '.join(bad)}（支持 {', '.join(EXPORT_FORMATS)}）",
+            code="bad_format",
+        )
+    if not fmts:
+        fmts = list(profile["preferred_formats"]["export_default"])
+
+    # ---- B0：本次事务固定的基准 ----
+    base_patches = list(session.patches)
+    b0_manifest = session.manifest
+    b0_hash = session.patch_hash()
+    b0_profile_issues = _profile_issues(session, profile)
+    original = _original_artifact_facts(session)
+    contract = engine_normalize.build_contract(
+        b0_manifest,
+        want,
+        profile=profile,
+        base_patches=base_patches,
+        profile_issues=b0_profile_issues,
+        meta={
+            "session_id": session.id,
+            "stem": session.stem,
+            "script": session.script,
+            "script_sha256": _script_sha256(session),
+            "patch_hash": b0_hash,
+            "worker_generation": getattr(session, "rev", None),
+            "original_artifact": original,
+            "profile": engine_profiles.stamp(profile),
+        },
+    )
+    plan = engine_normalize.plan_patches(contract, b0_manifest)
+    result: dict = {
+        "ok": False,
+        "session_id": session.id,
+        "stem": session.stem,
+        "contract": {
+            k: contract[k]
+            for k in ("contract_id", "targets", "allowed", "allowed_adjust", "budget", "profile_id")
+        },
+        "baseline": {
+            "patch_hash": b0_hash,
+            "manifest_hash": contract["baseline"]["manifest_hash"],
+            "size_mm": contract["baseline"]["size_mm"],
+            "script_sha256": contract["meta"]["script_sha256"],
+            "original_artifact": original,
+            "profile_issue_count": len(b0_profile_issues),
+            "geometry_issue_count": len(contract["baseline"]["geometry_issues"]),
+        },
+        "plan": {
+            "patches": plan["patches"],
+            "notes": plan["notes"],
+            "unsupported": plan["unsupported"],
+        },
+        "adjustments": [],
+        "rounds": [],
+        "files": [],
+    }
+    if not plan["patches"]:
+        result.update(
+            {"ok": True, "exit": engine_normalize.EXIT_NOTHING_TO_DO, "patch_hash": b0_hash}
+        )
+        return result
+
+    violations = engine_normalize.authorize(contract, plan["patches"])
+    if violations:  # 计划由目标推导，不该出现；出现了就是 bug，按越权退出而不是放行
+        result.update(
+            {"exit": engine_normalize.EXIT_REQUIRES_AUTHORIZATION, "violations": violations}
+        )
+        return result
+
+    candidate = engine_normalize.merge_patches(base_patches, plan["patches"])
+    relocated: set[str] = set()
+
+    def _compare(rel: set[str]) -> dict:
+        return engine_normalize.compare(
+            contract,
+            session.manifest,
+            profile_issues=_profile_issues(session, profile),
+            profile=profile,
+            relocated_legends=rel,
+            patches=list(session.patches),
+        )
+
+    def _rollback() -> None:
+        _render(session, base_patches, preview_dpi=None)
+
+    # 证据（§4.1）：每个阶段一张位图，落在运行时数据目录（不进项目、不进导出目录），
+    # 目录名就是合同 id。它们是**候选**，不是交付物——README 里写明。
+    ev_dir: Path | None = None
+    ev_files: list[str] = []
+    if evidence:
+        ev_dir = Path(engine_config.data_dir()) / "cache" / "normalize" / contract["contract_id"]
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        (ev_dir / "README.txt").write_text(
+            "Tavotto 保留式规范化的阶段证据（候选图，不是交付物）。\n"
+            f"contract {contract['contract_id']}；B0 patch_hash {b0_hash}；"
+            f"原始产物 {original.get('path')}（{original.get('size_mm')} mm）。\n"
+            "顺序：00-b0 → 01-targets → 0N-roundN-<step> → 最终导出见 export_dir。\n",
+            encoding="utf-8",
+        )
+        result["evidence_dir"] = str(ev_dir)
+
+    def _snap(tag: str) -> None:
+        if ev_dir is None:
+            return
+        try:
+            data = base64.b64decode(preview_png(session, list(session.patches), 1200))
+        except BridgeError as exc:
+            ev_files.append(f"{tag}: 位图失败 {exc.code}")
+            return
+        name = f"{len(ev_files):02d}-{tag}.png"
+        (ev_dir / name).write_bytes(data)
+        ev_files.append(name)
+
+    _snap("b0")
+    try:
+        render = _render(session, candidate, preview_dpi=None)
+        _snap("targets")
+        if render.get("warnings"):
+            # 有一条 override 没写进去 = 目标没有真的落地。不带着 warning 往下验。
+            _rollback()
+            result.update(
+                {
+                    "exit": engine_normalize.EXIT_UNSUPPORTED,
+                    "warnings": list(render["warnings"]),
+                    "patch_hash": session.patch_hash(),
+                }
+            )
+            return result
+        verdict = _compare(relocated)
+        result["rounds"].append(_round_record(0, "targets", verdict))
+
+        rounds = 0
+        while (
+            not verdict["ok"]
+            and verdict["exit"] == engine_normalize.EXIT_CONSTRAINT_CONFLICT
+            and verdict["repairable"]
+            and rounds < engine_normalize.MAX_REPAIR_ROUNDS
+        ):
+            rounds += 1
+            progressed = False
+            kinds = {b["repair"] for b in verdict["repairable"]}
+            if "margins" in kinds:
+                dirs = engine_normalize.repair_directions(
+                    [b for b in verdict["repairable"] if b["repair"] == "margins"]
+                )
+                cand = engine_normalize.adapt_margins(
+                    contract, session.manifest, directions=dirs or None
+                )
+                if "conflict" in cand:
+                    result["rounds"].append(
+                        {"round": rounds, "step": "margins", "conflict": cand["conflict"]}
+                    )
+                elif cand["patches"]:
+                    trial = engine_normalize.merge_patches(candidate, cand["patches"])
+                    if engine_normalize.authorize(contract, trial):
+                        raise BridgeError(
+                            "局部修复产生了约定之外的 patch（bug）", code="normalize_internal"
+                        )
+                    _render(session, trial, preview_dpi=None)
+                    v2 = _compare(relocated)
+                    if _better(v2, verdict):
+                        candidate, verdict = trial, v2
+                        result["adjustments"].extend(
+                            {**c, "reason": "margins", "round": rounds} for c in cand["changed"]
+                        )
+                        progressed = True
+                        result["rounds"].append(_round_record(rounds, "margins", v2))
+                        _snap(f"round{rounds}-margins")
+                    else:
+                        _render(session, candidate, preview_dpi=None)
+                        result["rounds"].append(
+                            {**_round_record(rounds, "margins", v2), "rejected": True}
+                        )
+            if "legend" in kinds:
+                legends = []
+                for b in verdict["repairable"]:
+                    if b["repair"] != "legend":
+                        continue
+                    for g in b.get("gids") or []:
+                        lg = engine_interference.legend_of(g) or (
+                            g if g.endswith(".legend") else ""
+                        )
+                        if lg and lg not in legends:
+                            legends.append(lg)
+                for lg in legends:
+                    best: tuple | None = None
+                    for loc in engine_normalize.legend_candidates(contract, lg):
+                        trial = engine_normalize.merge_patches(
+                            candidate, [{"gid": lg, "prop": "loc", "value": loc}]
+                        )
+                        _render(session, trial, preview_dpi=None)
+                        v2 = _compare(relocated | {lg})
+                        geo_now = engine_normalize.geometry_issues(session.manifest, profile)
+                        score = (
+                            len(v2["blocking"]),
+                            engine_normalize.legend_issue_count(geo_now, lg),
+                        )
+                        # 只收「图例自己干干净净」的候选：换到一个还在压别的东西的
+                        # 位置不叫修好，只是把问题换了个地方
+                        if (
+                            score[1] == 0
+                            and _better(v2, verdict)
+                            and (best is None or score < best[0])
+                        ):
+                            best = (score, trial, v2, loc)
+                            if score[0] == 0:
+                                break
+                    if best is not None:
+                        before = engine_normalize._field(
+                            engine_normalize._element(b0_manifest, lg) or {}, "loc"
+                        )
+                        candidate, verdict = best[1], best[2]
+                        relocated.add(lg)
+                        _render(session, candidate, preview_dpi=None)
+                        result["adjustments"].append(
+                            {
+                                "gid": lg,
+                                "prop": "loc",
+                                "before": before,
+                                "after": best[3],
+                                "reason": "legend",
+                                "round": rounds,
+                            }
+                        )
+                        progressed = True
+                        result["rounds"].append(_round_record(rounds, f"legend {lg}", verdict))
+                        _snap(f"round{rounds}-legend")
+                    else:
+                        _render(session, candidate, preview_dpi=None)
+                        result["rounds"].append(
+                            {"round": rounds, "step": f"legend {lg}", "rejected": True}
+                        )
+            if not progressed:
+                break
+
+        result["verdict"] = _public_verdict(verdict)
+        if ev_dir is not None:
+            result["evidence_files"] = list(ev_files)
+        if not verdict["ok"]:
+            _rollback()
+            result.update(
+                {
+                    "exit": verdict["exit"],
+                    "patch_hash": session.patch_hash(),
+                    "rolled_back": True,
+                }
+            )
+            return result
+
+        # ---- 导出 + 最终产物验收（临时目录里验，不过不发布）----
+        acceptance = {
+            "contract_id": contract["contract_id"],
+            "expect_mm": list(verdict["size_mm"]),
+            "font_family": want.get("font_family"),
+        }
+        pre_existing = [
+            i["id"]
+            for i in verdict["profile_issues"]["unchanged"] + verdict["profile_issues"]["improved"]
+            if i.get("severity") in ("error", "not_verifiable")
+        ]
+        exported = export(
+            session.id,
+            formats=fmts,
+            dpi=dpi,
+            stem=stem,
+            out_dir=out_dir,
+            profile_id=profile_id,
+            journal=journal,
+            # 事务自己已经按「新增 / 加重才挡」裁过；原有的阻断项保留并记进留档
+            explicit_confirm=True,
+            proof=True,
+            acceptance=acceptance,
+        )
+        result["files"] = exported["files"]
+        result["export_dir"] = exported["export_dir"]
+        result["proof_path"] = exported.get("proof_path")
+        result["acceptance"] = exported.get("acceptance", {})
+        result["kept_pre_existing"] = sorted(set(pre_existing))
+        failed = [f for f in exported["files"] if f["status"] != engine_exportjob.STATUS_DONE]
+        if failed:
+            # 事务失败：这一次作业里**已经发布**的其它格式与留档也撤回——它们描述的是
+            # 一个会话马上就要回退掉的状态，留在导出目录里就是「看起来成功的输出」。
+            withdrawn = []
+            for entry in exported["files"]:
+                if entry["status"] == engine_exportjob.STATUS_DONE and entry.get("path"):
+                    try:
+                        Path(entry["path"]).unlink()
+                        withdrawn.append(entry["path"])
+                    except OSError:
+                        pass
+            if exported.get("proof_path"):
+                try:
+                    Path(exported["proof_path"]).unlink()
+                    withdrawn.append(exported["proof_path"])
+                except OSError:
+                    pass
+            _rollback()
+            result.update(
+                {
+                    "exit": engine_normalize.EXIT_ACCEPTANCE_FAILED,
+                    "patch_hash": session.patch_hash(),
+                    "rolled_back": True,
+                    "failed_files": failed,
+                    "withdrawn_files": withdrawn,
+                    "files": [],
+                    "proof_path": None,
+                }
+            )
+            return result
+
+        # ---- 提交 ----
+        session.contract = contract
+        session.normalized = {
+            "contract_id": contract["contract_id"],
+            "patch_hash": session.patch_hash(),
+            "verdict_exit": verdict["exit"],
+            "acceptance_params": acceptance,
+            "files": [f["path"] for f in exported["files"]],
+            "stale": False,
+        }
+        result.update(
+            {
+                "ok": True,
+                "exit": engine_normalize.EXIT_DONE,
+                "patch_hash": session.patch_hash(),
+                "patches": list(session.patches),
+                "manifest": session.manifest,
+                "size_mm": verdict["size_mm"],
+                "rolled_back": False,
+            }
+        )
+        if replay_check:
+            replay = verify_replay(session.id)
+            result["replay"] = {
+                "ok": replay["ok"],
+                "compared_elements": replay["compared_elements"],
+                "divergence": replay["divergence"][:20],
+            }
+        return result
+    except BaseException:
+        _rollback()
+        raise
+
+
+def _round_record(n: int, step: str, verdict: dict) -> dict:
+    return {
+        "round": n,
+        "step": step,
+        "exit": verdict["exit"],
+        "blocking": [
+            {"id": b["id"], "gids": b["gids"], "bucket": b["bucket"], "repair": b["repair"]}
+            for b in verdict["blocking"]
+        ],
+        "max_edge_shift_mm": verdict["budget"]["max_edge_shift_mm"],
+    }
+
+
+def _public_verdict(v: dict) -> dict:
+    """裁决里给调用方看的那份：去掉 B0 整份快照那类大块头。"""
+
+    def slim(issues: list[dict]) -> list[dict]:
+        return [
+            {
+                "id": i["id"],
+                "severity": i.get("severity"),
+                "gids": i.get("gids"),
+                "text": i.get("text"),
+                "detail": i.get("detail"),
+                **({"before": i["before"], "after": i["after"]} if "before" in i else {}),
+            }
+            for i in issues
+        ]
+
+    return {
+        "ok": v["ok"],
+        "exit": v["exit"],
+        "size_mm": v["size_mm"],
+        "targets_met": v["targets_met"],
+        "protected_changes": v["protected_changes"],
+        "structure": v["structure"],
+        "font_unresolved": v["font_unresolved"],
+        "blocking": slim(v["blocking"]),
+        "profile_conflicts": slim(v.get("profile_conflicts") or []),
+        "issues": {
+            kind: {
+                bucket: slim(v[kind][bucket])
+                for bucket in ("new", "worsened", "unchanged", "improved")
+            }
+            for kind in ("geometry_issues", "profile_issues")
+        },
+        "budget": v["budget"],
+    }
+
+
+# --------------------------- 等价性自检（可选） -------------------------------
+def verify_replay(session_id: str) -> dict:
+    """`hot_apply(patches) == fresh_worker_replay(patches)` 的现场自检。
+
+    起一个**一次性 worker**（不进池、目录独立、用完即毁）从零全量重放同一组
+    patches，把两份 manifest 逐元素比几何——判据直接复用 Tavotto 写回事务用的
+    那把尺（`app._compare_manifests` 的容差口径：bbox/anchor 0.5% figure 分数、
+    size_mm 0.01mm）。热会话是增量的，「现在的样子」未必等于「从零重放一次的
+    样子」，而用户拿去投稿的是后者。
+    """
+    session = get_session(session_id)
+    if session.manifest is None:
+        raise BridgeError("会话还没有 manifest", code="no_manifest")
+    worker = engine_pool.one_shot(session.script, session.project, session.entry)
+    try:
+        resp = worker.override(session.stem, session.patches, None, inline_svg=False)
+        fresh = resp["manifest"]
+    except engine_pool.WorkerError as exc:
+        raise BridgeError(
+            f"重放失败: {exc}", code=exc.code or "replay_failed", traceback=exc.traceback_text
+        ) from exc
+    finally:
+        engine_pool.discard(worker)
+
+    diffs, compared = compare_manifests(session.manifest, fresh)
+    return {
+        "ok": not diffs,
+        "session_id": session.id,
+        "stem": session.stem,
+        "patch_hash": session.patch_hash(),
+        "compared_elements": compared,
+        "divergence": diffs,
+        "fresh_manifest_hash": manifest_hash(fresh),
+        "hot_manifest_hash": manifest_hash(session.manifest),
+    }
+
+
+_BBOX_TOL = 0.005  # figure 分数
+_SIZE_TOL = 0.01  # mm
+
+
+def _f(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def compare_manifests(hot: dict, fresh: dict) -> tuple[list[dict], int]:
+    """两份 manifest 的几何比对。与 `app._compare_manifests` 同口径。"""
+    diffs: list[dict] = []
+    hs, fs = hot.get("size_mm") or [], fresh.get("size_mm") or []
+    for i, axis in enumerate("wh"):
+        a, b = _f(hs[i] if i < len(hs) else None), _f(fs[i] if i < len(fs) else None)
+        if a is None or b is None or abs(a - b) > _SIZE_TOL:
+            diffs.append({"gid": "figure", "field": f"size_mm.{axis}", "hot": a, "fresh": b})
+    by_gid = {e.get("gid"): e for e in fresh.get("elements") or []}
+    matched: set = set()
+    compared = 0
+    for el in hot.get("elements") or []:
+        gid = el.get("gid")
+        other = by_gid.get(gid)
+        if other is None:
+            # **结构分歧也是分歧**：重放里根本没有这个元素时静默跳过，等于
+            # 让 `ok: true` 出现在两张画得完全不一样的图上——而「脚本不确定
+            # / 重放有 bug」恰恰是这个自检唯一要抓的东西。
+            diffs.append({"gid": gid, "field": "missing_in_fresh", "hot": "present", "fresh": None})
+            continue
+        matched.add(gid)
+        compared += 1
+        for field_name in ("bbox", "anchor"):
+            a, b = el.get(field_name), other.get(field_name)
+            if not isinstance(a, list) or not isinstance(b, list) or len(a) != len(b):
+                continue
+            for k, (x, y) in enumerate(zip(a, b)):
+                fx, fy = _f(x), _f(y)
+                if fx is None or fy is None or abs(fx - fy) > _BBOX_TOL:
+                    diffs.append(
+                        {
+                            "gid": el.get("gid"),
+                            "field": f"{field_name}[{k}]",
+                            "hot": fx,
+                            "fresh": fy,
+                        }
+                    )
+    # 只在重放里出现的元素同样要报：热会话少画了一个 artist 与多画了一个，
+    # 对「用户拿去投稿的是重放那份」来说是同一类问题
+    for gid in by_gid:
+        if gid not in matched:
+            diffs.append({"gid": gid, "field": "missing_in_hot", "hot": None, "fresh": "present"})
+    return diffs, compared
+
+
+def manifest_hash(manifest: dict) -> str:
+    """manifest 的内容指纹（canonical JSON 的 sha256）——与 app.py 同法。"""
+    import hashlib
+
+    text = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+    )
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()

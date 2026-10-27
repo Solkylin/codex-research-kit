@@ -1,0 +1,13 @@
+digraph figures {
+  graph [rankdir=LR, bgcolor="transparent", pad="0.2", nodesep="0.35", ranksep="0.5"];
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=11, color="#334155", fillcolor="#f8fafc", margin="0.14,0.08"];
+  edge [color="#64748b", penwidth=1.4, arrowsize=0.7];
+  source [label="源数据 + 脚本", fillcolor="#dbeafe"];
+  contract [label="figure contract\n结论/单位/误差/尺寸", fillcolor="#e0e7ff"];
+  backend [label="单一数据后端\nPython / MATLAB / R", fillcolor="#dcfce7"];
+  vector [label="可编辑矢量输出\nSVG / PDF / EPS / TIFF"];
+  refine [label="Tavotto / Inkscape\n细节精修", fillcolor="#fef3c7"];
+  render [label="独立渲染检查\n字体/对比/标签/版面"];
+  final [label="出版级图表", fillcolor="#bbf7d0"];
+  source -> contract -> backend -> vector -> refine -> render -> final;
+}

@@ -1,0 +1,81 @@
+{
+  "reviewed_on": "2026-10-14",
+  "local_adapted_on": "2026-10-19",
+  "scope": "Versioned upstream method references; no automatic executable installation or runtime-tool claim",
+  "sources": [
+    {
+      "name": "Scientific Slides",
+      "version": "1.12",
+      "commit": "a1043ef544e3a100c28e70a736b6cf32554d0677",
+      "repo": "https://github.com/K-Dense-AI/scientific-agent-skills",
+      "selected": "Narrative, design, scientific plots, native PowerPoint and visual review references; local technical-presentations remains authoritative"
+    },
+    {
+      "name": "Docling official skill",
+      "version": "2.138.0",
+      "repo": "https://github.com/docling-project/docling/tree/v2.138.0/docling/.agents/skills/docling",
+      "selected": "Official entry and API references, read on demand"
+    }
+  ],
+  "files": [
+    {
+      "file": "scientific-slides-1.12/references/presentation_structure.md",
+      "sha256": "8e79965dd65ca56a7e239920867b36be1b2f626cee9e65e99e4d6efaaa883004"
+    },
+    {
+      "file": "scientific-slides-1.12/references/slide_design_principles.md",
+      "sha256": "6b50148bc161c80272b16da445dfdb87f966a32ccd3a28ff94dedc940dd6fbff"
+    },
+    {
+      "file": "scientific-slides-1.12/references/data_visualization_slides.md",
+      "sha256": "ff0b437dae2cc74b9290907ade331dc69cb1365071584ef2a854f5ade3a53408"
+    },
+    {
+      "file": "scientific-slides-1.12/references/visual_review_workflow.md",
+      "sha256": "38138ef5f10b92f6d8965906438235bbb9ff08c8839545501a00bd6b799ab581"
+    },
+    {
+      "file": "scientific-slides-1.12/references/common_pitfalls.md",
+      "sha256": "1624aa65d42d52469a06727e6a68c5ba66cce311020f107659de7ca80654888b"
+    },
+    {
+      "file": "scientific-slides-1.12/assets/powerpoint_design_guide.md",
+      "sha256": "afacd3ac9b33311a86ebf1398bc960279b1412a77a25c3ce5429ebbf3e50d94a"
+    },
+    {
+      "file": "docling-2.138.0-skill/UPSTREAM.md",
+      "sha256": "d5e0b1c0c108850621c33dab1fa3da83bcefc52351e93028752f6df973f90998"
+    },
+    {
+      "file": "docling-2.138.0-skill/references/cli.md",
+      "sha256": "4a7dd31489f9f77a8df59e722902acd5b1b6aa24bb62f3f9de9845d52f17fe34"
+    },
+    {
+      "file": "docling-2.138.0-skill/references/extraction.md",
+      "sha256": "174cc38d544a68aecd934e1706d1d4ef7df011fbc936aa0dc6f43d25dc6dafb5"
+    },
+    {
+      "file": "docling-2.138.0-skill/references/python-sdk.md",
+      "sha256": "6ca5b1d6fc0758c2ae137b105e34c5d78f7d623c3dbea26dfe65458e11f827f0"
+    },
+    {
+      "file": "docling-2.138.0-skill/references/rag.md",
+      "sha256": "0036ad0e2b28b338ba23f8af508f8cefb06df12f3ef81ab620cdede51290569f"
+    },
+    {
+      "file": "docling-2.138.0-skill/references/service-client.md",
+      "sha256": "6e9ab15bea5ea25fa42fc99f47b7a0599882e711db32123271d4453c73821241"
+    },
+    {
+      "file": "docling-2.138.0-skill/references/slim-packaging.md",
+      "sha256": "25201405686287cca8a4244956ed91ee8d44dbb11fe914d549592e58593ad8e3"
+    },
+    {
+      "file": "scientific-slides-1.12/assets/timing_guidelines.md",
+      "sha256": "39f4720e9d5a602d6c16af0985232fbc78d4e79598e7ed17a2bc076efc9cc195"
+    }
+  ],
+  "example_guides": [
+    "https://mitcommlab.mit.edu/meche/commkit/technical-presentation/"
+  ]
+}

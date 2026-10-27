@@ -1,0 +1,7 @@
+interface:
+  display_name: "出版级科研绘图"
+  short_description: "按现有数据链生成、交互精修并导出可编辑、可复现的科研图表"
+  default_prompt: "使用 $publication-figures，依据科学结论、数据语义与目标格式生成或精修科研图表，按需选择交互编辑器并检查实际成品。"
+policy:
+  allow_implicit_invocation: false
+

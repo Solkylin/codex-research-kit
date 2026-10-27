@@ -1,0 +1,1982 @@
+#!/usr/bin/env python3
+"""Codex 起 MCP server 的那一跳：**先找到装着 tavotto 引擎的解释器，再交棒**。
+
+Codex 用 `python3 ./mcp/server.py` 启动本文件（见 `codex.mcp.json`），而那个 `python3`
+不一定是装了 Tavotto 的那个——用户多半是 `pipx install tavotto` 或装的桌面版。
+所以本文件的全部职责就是**运行时解析（resolver）**：
+
+  1. 当前解释器 `import tavotto.engine` 成功 → 直接跑，不折腾；
+  2. 否则按固定优先级找一个**验证过能 import 引擎**的解释器（见
+     `resolver_candidates()`），交棒过去（POSIX 用 `os.execv`——同一个进程，stdio
+     原样继承，host 那边察觉不到换过人；Windows 用子进程，见 `_hand_off()`）。候选链里**用户显式指定的永远最先**，
+     插件自管 runtime 其次，从 CLI 反推的与 PATH 兜底最后；
+  3. 找不到时起一个**只会说人话的降级 server**：initialize 照常握手，
+     tools/list 只列一个 `tavotto_health`（诊断工具，真的可用），六个正常
+     工具名的调用回结构化错误——**绝不把不可用的工具伪装成可用**，也绝不
+     静默退出（那样用户在 Codex 里看到的只是「插件没有工具」）。
+
+## 「验证过」是硬门槛
+
+每个候选都要真的跑一遍 `import tavotto.engine` 才算数。**frozen 的
+`tavotto-cli`（桌面版带的）永远给不出解释器**：它是 PyInstaller 单件，没有
+shebang、旁边没有 python——交接（`tavotto open`）用它绰绰有余，MCP server
+却要在进程内 import 引擎，这两件事不能混。见 `diagnose()` 的四态。
+
+## 插件自管 runtime（`--provision`）
+
+`python3 mcp/server.py --provision` 在 **Tavotto 用户配置目录**下建一个
+插件专属 venv（`mcp-runtime/venv`），装**钉在插件版本上的** tavotto——
+不碰系统 Python / Conda / 用户任何全局环境，删掉目录即卸载，重跑即重建
+（可复现）。装完 resolver 自动优先用它。这是「桌面版用户零手工配置」的
+路：跑一条命令，不用自己建 venv、不用改 PATH。**建 venv 的基础解释器先验
+版本**（`find_venv_base()`）：跑本文件的 `python3` 可以很老，venv 不能。
+
+## 体检（`--health`）
+
+`python3 mcp/server.py --health` 输出一行 JSON：resolver 每一步的结论与
+耗时、引擎在哪 / 缺什么、画布产物在不在、桌面版装没装。**它区分得开**
+「插件装了但没引擎」「引擎在但画布产物缺失」「一切就绪但 Codex 会话还没
+重载工具」这几种在 `codex plugin list` 里长得一模一样的状态。
+
+纯标准库，Python 3.8+（找不到 tavotto 时用户机器上的 python3 可能很老）。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+#: 显式指定 MCP server 用哪个解释器（最高优先级；指错了如实报错，不悄悄换）
+MCP_PYTHON_ENV = "TAVOTTO_MCP_PYTHON"
+#: 渲染解释器的两个环境变量（与 engine/pool.worker_python_env() 同源的名字）。
+#: 它们指向的通常是科学栈环境；装了 tavotto 的话 MCP 也能直接用。
+WORKER_PYTHON_ENVS = ("TAVOTTO_WORKER_PYTHON", "MM_WORKER_PYTHON")
+#: execv 交棒后的防环护栏：棒交过去了 import 还是失败（装了一半的环境），
+#: 不许再交第二次——那是无限 exec 循环。
+_EXECED_ENV = "TAVOTTO_MCP_EXECED"
+
+
+def _self_command() -> str:
+    """恢复步骤里「再跑一次本启动器」的真实命令行：当前解释器 + 本文件的绝对路径。
+
+    不写 `python3 <插件目录>/...` 这种占位：非 Codex 宿主的用户不知道「插件目录」
+    在哪，Windows 上 `python3` 还可能是商店别名。每个参数都按本平台 shell 的规则转义
+    （不只是含空格的：`/tmp/Tavotto;old`、`C:\\Tavotto&old` 照原样粘进终端会被拆开或
+    多跑一条命令，Codex 在 #559 上指出）。
+    """
+    parts = [sys.executable, os.path.abspath(__file__)]
+    if os.name == "nt":
+        # Windows 按 PowerShell 写（Windows Terminal / VS Code 终端的默认 shell）：开头一个带引号
+        # 的 token 在 PowerShell 里只是字符串，必须用调用运算符 `&` 才会执行。每段用单引号——
+        # PowerShell 的单引号里 `$`、反引号、`&` 都是字面量（双引号会展开 `$x`），内部的 '
+        # 写成 ''。Codex 在 #559 上指出只带双引号的形式粘进 PowerShell 跑不起来。
+        return "& " + " ".join("'" + p.replace("'", "''") + "'" for p in parts)
+    # POSIX：每段都用单引号包住，内部的 ' 写成 '\''（与 shlex.quote 同一规则；不为这一行
+    # 多 import 一个模块——启动器的 import 表是受看护的最小集）
+    return " ".join("'" + p.replace("'", "'\\''") + "'" for p in parts)
+
+
+#: 装好 / 升级之后宿主要做的那一步。**不是只有 Codex**：同一个启动器被 Codex 插件与
+#: `integrations/configure.py` 生成的其他宿主配置共用，各家「让已开的会话重新拿到工具」
+#: 的动作不同，这里只说共性，具体按键在宿主的接入说明里。
+RELOAD_HINT = (
+    "装完要让宿主重新加载 MCP 服务：Codex 新开一次会话；其他宿主重启 tavotto 这个 MCP 服务"
+    "或重开对话——已开的会话不会自己重新加载工具"
+)
+
+
+#: 只装了桌面版时的那一格。**不能说「没装 Tavotto」**——他明明装了。
+DESKTOP_ONLY_HINT = (
+    "这台机器上装的是 Tavotto 桌面版。交接（把图交给 Tavotto 窗口打开）照常能用，"
+    "但宿主里的内嵌画布与 MCP 工具需要一个能 import tavotto 的 Python 环境——"
+    "桌面版带的 tavotto-cli 是打包成单文件的可执行程序，给不出解释器。"
+    "两条恢复路（可共存）：① 一条命令建插件自管环境："
+    f"`{_self_command()} --provision`；"
+    "② `pipx install tavotto`（或 `pip install tavotto`）。"
+    "（" + RELOAD_HINT + "。）"
+)
+
+
+# ------------------------------ 单点探测 -----------------------------------
+#: 桥（tavotto_mcp/bridge.py）真正 import 的那组引擎模块。**验证的就是这组**，
+#: 不是笼统的 `import tavotto.engine`：2026-08-20 实测，PyPI 的 0.8.0 wheel
+#: 发在 telemetry 合并之前——engine 包 import 得动、bridge 一 import 就
+#: ImportError，resolver 交棒过去 server 当场崩死（比诚实降级糟得多）。
+#: 两侧由 tests/test_mcp_resolver.py::test_bridge_import_probe_matches_the_bridge
+#: 对拍，改 bridge 的 import 必须同步这里。
+_BRIDGE_IMPORT = (
+    "from tavotto.engine import artifactcheck, artifactinspect, config, deprepair, exportjob, exportreq, "
+    "figcapture, handoff, interference, normalize, patchspec, pool, preflight, previewbudget, "
+    "profiles, profilestore, project_refresh, readiness, registry, telemetry, workdir"
+)
+
+
+def _importable(python: str, timeout: float = 30.0) -> bool:
+    """这个解释器装的 tavotto 引擎**够不够本插件用**。
+
+    判据是 `_BRIDGE_IMPORT`（桥需要的整组模块）而不是 `import tavotto`：
+    同名空壳、或版本太旧缺模块的环境都不算数——放它过关的下场是交棒后
+    在 host 面前崩死。
+    """
+    try:
+        proc = subprocess.run(
+            # `-B`：只读探测，不往候选解释器的安装目录写 .pyc（与引擎侧 `runtime.probe_args` 同一条）
+            [python, "-B", "-c", _BRIDGE_IMPORT],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _current_engine_ok() -> bool:
+    """当前解释器里的引擎够不够用（与 `_importable` 同一把尺，进程内验）。"""
+    try:
+        exec(_BRIDGE_IMPORT, {})
+    except Exception:  # noqa: BLE001 — 缺模块/坏安装都算不够
+        return False
+    return True
+
+
+def _plugin_locator():
+    """插件自带的那份定位器（`engine/locate.py` 的镜像，有矩阵测试看着）。
+
+    与本文件同属一个插件包，按相对路径 import 即可——**不在这里抄第三遍**
+    路径规则（Tavotto 一份、插件的 handoff 一份，已经是能接受的上限）。
+    """
+    scripts = os.path.abspath(os.path.join(HERE, "..", "skills", "tavotto-figure", "scripts"))
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import handoff  # noqa: PLC0415
+
+    return handoff
+
+
+#: 读多语言头第二行的字节上限（见 `_shebang_interpreter`）。
+_POLYGLOT_LINE_MAX = 8192
+
+
+def _shebang_interpreter(script: str) -> "str | None":
+    """console script 的 shebang → 装着 tavotto 的那个解释器。
+
+    pip / pipx 生成的 `tavotto` 就是一个带 `#!<venv>/bin/python` 的小脚本，
+    这一行是「哪个环境装了它」最可靠的答案。桌面版的 `tavotto-cli` 是
+    frozen 二进制，没有 shebang——它走不到这条，正好是我们要区分的那一格。
+    """
+    try:
+        with open(script, "rb") as f:
+            first = f.readline(512)
+            # 多语言头第二行装着完整解释器路径：上限按路径上限给（Linux PATH_MAX
+            # 4096，另留引号与 `"$0" "$@"` 的余量），不能按 1 KiB 截断
+            second = f.readline(_POLYGLOT_LINE_MAX)
+    except OSError:
+        return None
+    if not first.startswith(b"#!"):
+        return None
+    parts = first[2:].strip().decode("utf-8", "replace").split()
+    # `#!/usr/bin/env python3` 给不出具体环境，直接放弃
+    if not parts or parts[0].endswith("env"):
+        return None
+    if os.path.basename(parts[0]) == "sh":
+        # venv 路径含空格时（macOS 上 pipx 默认的 `~/Library/Application
+        # Support/pipx` 就是），pip / pipx 写不了 `#!<带空格的路径>`，改写成
+        # sh/python 多语言头：第一行 `#!/bin/sh`，第二行
+        # `'''exec' '<python>' "$0" "$@"`——真正的解释器在第二行（#486）。
+        cand = _polyglot_exec_target(second.decode("utf-8", "replace"))
+        return cand if cand and os.path.isfile(cand) else None
+    return parts[0] if os.path.isfile(parts[0]) else None
+
+
+def _polyglot_exec_target(line: str) -> "str | None":
+    """pip / pipx（distlib）多语言 wrapper 第二行里被 exec 的解释器路径。
+
+    引号单双都认（distlib 版本之间变过）；不是这个形状就给 None。启动器只许用
+    标准库里已登记的那几个模块，这里用字符串切而不引入 `re`。
+    """
+    prefix = "'''exec' "
+    rest = line[len(prefix) :] if line.startswith(prefix) else ""
+    if not rest or rest[0].isspace():
+        return None
+    if rest[0] not in "'\"":
+        # 路径不带空格、只是太长（超过 shebang 长度上限：Linux 127 / macOS 512）
+        # 时 distlib 同样写多语言头，但目标**不加引号**：取到下一个空白为止
+        return rest.split(None, 1)[0]
+    end = rest.find(rest[0], 1)
+    return rest[1:end] or None if end > 0 else None
+
+
+#: 扫 Windows 启动器里那行 shebang 时的体积上限。distlib 的 launcher 约
+#: 100 KB；桌面版那个 frozen 的 `tavotto-cli.exe` 是几十 MB——上限顺带保住了
+#: 「这条腿能区分 pip 装的与桌面版自带的」这个性质。
+_LAUNCHER_SCAN_MAX = 2 * 1024 * 1024
+
+
+def _embedded_shebang(exe: str) -> "str | None":
+    r"""Windows console script `.exe` 里嵌着的解释器路径。
+
+        pip / pipx 在 Windows 上生成的 `tavotto.exe` 是 distlib 启动器：
+        `launcher.exe` + `b"#!<venv>\Scripts\python.exe
+    "` + 一个 zip。
+        **pipx 还会把它复制到共享的 bin 目录暴露出来**，那儿旁边根本没有 python
+        （venv 在 `pipx/venvs/tavotto` 里），`_interpreter_beside` 因此一无所获，
+        `_shebang_interpreter` 又只读头 512 字节的文本 shebang——两条都落空，
+        于是官方推荐的 `pipx install tavotto` 在 Windows 上被判成 `desktop_only`，
+        MCP 的工具一个都不出现。复制品里那行 shebang 仍然指着 venv，
+        它是「哪个环境装了它」在 Windows 上唯一可靠的答案。
+    """
+    try:
+        if os.path.getsize(exe) > _LAUNCHER_SCAN_MAX:
+            return None
+        with open(exe, "rb") as fh:
+            blob = fh.read(_LAUNCHER_SCAN_MAX)
+    except OSError:
+        return None
+    at = blob.rfind(b"#!")
+    while at != -1:
+        line = blob[at + 2 : blob.find(b"\n", at) if blob.find(b"\n", at) != -1 else len(blob)]
+        cand = line.strip().strip(b'"').decode("utf-8", "replace").strip()
+        # 只认指向真实文件的绝对路径；`#!/usr/bin/env python3` 给不出环境
+        if cand and not cand.endswith("env") and os.path.isfile(cand):
+            return cand
+        at = blob.rfind(b"#!", 0, at)
+    return None
+
+
+def _interpreter_beside(exe: str) -> "list[str]":
+    """与 `tavotto.exe` / pipx shim 同目录的 python（Windows 上没有 shebang）。
+
+    桌面版的 `tavotto-cli.exe` 旁边**没有** python（PyInstaller onedir 把运行时
+    放在 `_internal/`），所以这条天然区分「pip 装的」与「桌面版带的」。
+    """
+    base = os.path.dirname(os.path.abspath(exe))
+    return [
+        os.path.join(base, n)
+        for n in ("python.exe", "python3", "python")
+        if os.path.isfile(os.path.join(base, n))
+    ]
+
+
+def _interp_key(path: str) -> str:
+    """解释器的**身份键**：规范化路径，但**绝不 realpath**。
+
+    venv 的 `bin/python3` 是指向基础解释器的符号链接，realpath 会把它解析成
+    `/opt/homebrew/...python3.13`——于是「自管 venv」被判成「就是当前解释器」
+    而**跳过探测**（2026-08-20 实测：provision 刚成功，server 却照样降级）。
+    符号链接指向同一个二进制的两个 venv 是**两个不同的解释器**（pyvenv.cfg
+    与 argv0 决定 site-packages），身份必须按调用路径算。
+    """
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def _interpreters_behind(cmd: "list[str] | None") -> "list[str]":
+    """CLI 背后的那个 Python 环境：shebang / Windows 启动器里嵌的 shebang / 同目录的 python。
+
+    这组**只从 CLI 反推**，不含 PATH 兜底——「这台机器上的 tavotto 装在哪个解释器里」
+    的答案只能来自 tavotto 自己。桌面版的 frozen `tavotto-cli` 三条都落空（无 shebang、
+    旁边无 python），这正是「装的是桌面版」与「装的是 pip 形态的引擎」的分界。
+    """
+    out: "list[str]" = []
+    for exe in cmd or []:
+        interp = _shebang_interpreter(exe) or _embedded_shebang(exe)
+        if interp:
+            out.append(interp)
+        out.extend(_interpreter_beside(exe))
+    return out
+
+
+def _interpreters_for(found: dict) -> "list[str]":
+    """定位结果 → 可能能 import tavotto 的解释器候选（CLI 反推 + PATH 兜底）。"""
+    out: "list[str]" = _interpreters_behind(found.get("cmd"))
+    for name in ("python3", "python"):
+        which = shutil.which(name)
+        if which:
+            out.append(which)
+    seen, uniq = set(), []
+    for p in out:
+        key = _interp_key(p)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return uniq
+
+
+# --------------------------- 插件自管 runtime -------------------------------
+def managed_runtime_dir() -> str:
+    """插件自管环境的家：`<Tavotto 配置目录>/mcp-runtime`。
+
+    落在用户配置目录（目录规则复用定位器的 `config_dir()`，不抄第三遍）：
+    插件安装目录归 Codex 管、升级时整个被换掉，**绝不往里写**。
+    """
+    return os.path.join(_plugin_locator().config_dir(), "mcp-runtime")
+
+
+def managed_cache_dir() -> str:
+    """自管环境的缓存归宿：`mcp-runtime/cache`（#733）。
+
+    自管 venv 不在 Tavotto 数据目录里（本文件在引擎不可用时拿不到 `config.data_dir()`），它的 pip /
+    matplotlib 缓存就放在它自己旁边：删掉 `mcp-runtime` 即卸载干净，`venv --clear` 重建时缓存留着复用。
+    两个用处——这里 `--provision` 起的 pip（`provision_env()`），以及引擎从这个解释器起的 worker /
+    探测（`engine/runtime.owned_env` 按 `runtime.PLUGIN_RUNTIME_DIRNAME` 认出它，算出的是同一个目录；
+    `tests/test_probe_leaves_no_trace.py` 两侧对拍）。
+    """
+    return os.path.join(managed_runtime_dir(), "cache")
+
+
+def provision_env() -> dict:
+    """`--provision` 起子进程（建 venv、pip install）用的环境：`PIP_CACHE_DIR` → `mcp-runtime/cache/pip`。
+
+    与引擎侧 `runtime.owned_env` 的 pip 那一半同义：**只改缓存的位置**，用户 pip 配置里的 index-url /
+    代理 / 证书照样生效（不加 `--isolated`），用户关掉缓存（`no-cache-dir`）照样压过它。不设
+    `MPLCONFIGDIR`：provision 这一段不 import matplotlib（装包 + 验 `import tavotto.engine`），
+    从这个解释器起的 worker 由引擎按 `runtime._owned_mplconfigdir` 定。
+    """
+    env = dict(os.environ)
+    env["PIP_CACHE_DIR"] = os.path.join(managed_cache_dir(), "pip")
+    return env
+
+
+def managed_python() -> str:
+    """自管 venv 里的解释器路径（存不存在由调用方查）。"""
+    venv = os.path.join(managed_runtime_dir(), "venv")
+    if os.name == "nt":
+        return os.path.join(venv, "Scripts", "python.exe")
+    return os.path.join(venv, "bin", "python3")
+
+
+#: 引擎的 Python 支持区间——`engine/projectenv.PYTHON_MIN` / `PYTHON_MAX_EXCLUSIVE`
+#: 的镜像（插件 import 不到 tavotto，与定位器一样是无法避免的那份重复）。两侧由
+#: tests/test_mcp_resolver.py::test_provision_python_range_mirrors_the_engine 对拍，
+#: projectenv 那侧又被 test_support_matrix 钉在 pyproject 的 requires-python 上。
+#:
+#: 它在这里只有一个用途：**建 venv 之前先判基础解释器**。启动本文件的 `python3`
+#: 允许很老（本文件只用标准库，3.8 就能跑），但 venv 继承它的版本，而区间外的
+#: 解释器上 pip 对 `tavotto==x.y.z` 只会说 "No matching distribution found"
+#: （3.9 自带的 pip 21 连「哪些版本因 Requires-Python 被忽略」都不打印）——
+#: 2026-09-20 一位 macOS 用户在 Xcode CLT 的 `/usr/bin/python3`（3.9.6）上撞到，
+#: Codex 把它读成「0.15.0 还没发」。
+PYTHON_MIN = (3, 10)
+PYTHON_MAX_EXCLUSIVE = (3, 15)
+assert PYTHON_MIN[0] == PYTHON_MAX_EXCLUSIVE[0] == 3, (
+    "候选名字按 3.x 枚举，跨大版本要改 _SUPPORTED_MINORS"
+)
+#: 支持区间里的小版本号，**新的在前**：都能用时挑最新的（wheel 齐全，也是桌面版
+#: runtime 所在的那一带）。
+_SUPPORTED_MINORS = tuple(range(PYTHON_MAX_EXCLUSIVE[1] - 1, PYTHON_MIN[1] - 1, -1))
+_PROBE_VERSION = "import sys; print(sys.version_info[0], sys.version_info[1], sys.executable)"
+
+
+def python_range_text() -> str:
+    """给人看的区间：`3.10–3.14`。"""
+    return (
+        f"{PYTHON_MIN[0]}.{PYTHON_MIN[1]}–{PYTHON_MAX_EXCLUSIVE[0]}.{PYTHON_MAX_EXCLUSIVE[1] - 1}"
+    )
+
+
+def _python_supported(version: "tuple[int, int] | None") -> bool:
+    return version is not None and PYTHON_MIN <= tuple(version) < PYTHON_MAX_EXCLUSIVE
+
+
+def _probe_python(argv: "list[str]", timeout: float = 15.0) -> "dict | None":
+    """真的跑一遍 argv 指向的解释器，回 `{"python": 它自报的路径, "version": (major, minor)}`。
+
+    判据是执行，不是文件名：Windows 商店的 App Execution Alias 叫 `python3.exe`，
+    退出码 9009、零输出；pyenv 的 shim 可能指向一个没装的版本；`py -3.13` 这种
+    启动器命令要它自己说出 `sys.executable` 才知道解释器在哪。起不来 / 不是
+    Python / 超时一律回 None。
+    """
+    try:
+        proc = subprocess.run(
+            [*argv, "-B", "-c", _PROBE_VERSION], capture_output=True, text=True, timeout=timeout
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    parts = (proc.stdout or "").strip().split(" ", 2)
+    try:
+        version = (int(parts[0]), int(parts[1]))
+    except (IndexError, ValueError):
+        return None
+    reported = parts[2].strip() if len(parts) == 3 else ""
+    python = reported if reported and os.path.isfile(reported) else argv[0]
+    return {"python": python, "version": version}
+
+
+def _venv_base_candidates(explicit: "str | None" = None) -> "list[list[str]]":
+    """建自管 venv 的基础解释器候选（argv 形式，按优先级，只列磁盘上存在的）。
+
+    显式 `--python` 只认它一个——指错了如实报错，不悄悄换（与 `TAVOTTO_MCP_PYTHON`
+    同一条纪律）。否则：当前解释器 → PATH 上带版本号的名字（新的在前）→ 常见安装
+    位置（Codex 桌面壳起的进程 PATH 往往只有 `/usr/bin:/bin`，Homebrew / python.org
+    装的解释器根本不在里面，而 `/usr/bin/python3` 正是那个太老的）→ Windows 的
+    `py` 启动器（它知道 python.org 装的每个版本在哪）→ PATH 上的裸 `python3` / `python`。
+    """
+    if explicit:
+        return [[explicit]]
+    out: "list[list[str]]" = [[sys.executable]]
+    for minor in _SUPPORTED_MINORS:
+        which = shutil.which(f"python3.{minor}")
+        if which:
+            out.append([which])
+    if os.name == "nt":
+        # python.org 的安装器默认带 `py` 启动器，它知道每个装过的版本在哪——不在这里
+        # 抄 Windows 的安装路径规则（路径规则归定位器，tests/test_codex_plugin.py 看着）
+        py = shutil.which("py")
+        if py:
+            out.extend([py, f"-3.{minor}"] for minor in _SUPPORTED_MINORS)
+    else:
+        for minor in _SUPPORTED_MINORS:
+            out.append([f"/opt/homebrew/bin/python3.{minor}"])
+            out.append([f"/usr/local/bin/python3.{minor}"])
+            out.append(
+                [f"/Library/Frameworks/Python.framework/Versions/3.{minor}/bin/python3.{minor}"]
+            )
+    for name in ("python3", "python"):
+        which = shutil.which(name)
+        if which:
+            out.append([which])
+    seen, uniq = set(), []
+    for argv in out:
+        if len(argv) == 1 and not os.path.isfile(argv[0]):
+            continue
+        key = " ".join(_interp_key(argv[0]) if i == 0 else a for i, a in enumerate(argv))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(argv)
+    return uniq
+
+
+def find_venv_base(explicit: "str | None" = None) -> "tuple[str | None, list[dict]]":
+    """挑第一个在支持区间内的基础解释器；回 (它的路径或 None, 逐个试过的记录)。
+
+    记录里每条都带它自报的版本——失败时用户要看到的是「`/usr/bin/python3` 是 3.9」，
+    而不是一句「没找到」。
+    """
+    tried: "list[dict]" = []
+    for argv in _venv_base_candidates(explicit):
+        info = _probe_python(argv)
+        version = info["version"] if info else None
+        entry = {
+            "python": " ".join(argv),
+            "version": f"{version[0]}.{version[1]}" if version else None,
+            "supported": _python_supported(version),
+        }
+        tried.append(entry)
+        if entry["supported"]:
+            return info["python"], tried
+    return None, tried
+
+
+def _configured_worker_python() -> "str | None":
+    """Tavotto 设置里指定的渲染解释器（config.json 的 worker.python）。
+
+    读的是 `engine/config.py` 写的那份用户配置；键名两侧同源。装了 tavotto
+    的话它同样能当 MCP 解释器（要过 `_importable` 这一关才算数）。
+    """
+    cfg_path = os.path.join(_plugin_locator().config_dir(), "config.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    worker = data.get("worker")
+    python = worker.get("python") if isinstance(worker, dict) else None
+    return python if isinstance(python, str) and python.strip() else None
+
+
+def resolver_candidates(found: dict, environ: "dict | None" = None) -> "list[tuple[str, str]]":
+    """解释器候选（(路径, 来源标签)，前面的赢）。**当前解释器不在表里**——
+    它在 `main()` 里已经试过（试过才会走到这儿）。
+
+      1. `TAVOTTO_MCP_PYTHON`       用户显式指给 MCP 的，永远第一
+      2. `TAVOTTO_WORKER_PYTHON`    渲染解释器（装了 tavotto 才算数）
+      3. 设置里的 worker.python     同上
+      4. 插件自管 runtime           `--provision` 建的那个 venv
+      5. 从 tavotto CLI 反推        pip/pipx 装的 console script 的 shebang
+      6. PATH 里的 python3/python   兜底
+
+    frozen 的 `tavotto-cli` 在 5 里天然出局（无 shebang、旁边无 python）。
+    """
+    env = os.environ if environ is None else environ
+    cands: "list[tuple[str, str]]" = []
+    override = (env.get(MCP_PYTHON_ENV) or "").strip()
+    if override:
+        cands.append((override, "mcp_env"))
+    for name in WORKER_PYTHON_ENVS:
+        value = (env.get(name) or "").strip()
+        if value:
+            cands.append((value, "worker_env"))
+    configured = _configured_worker_python()
+    if configured:
+        cands.append((configured, "configured"))
+    cands.append((managed_python(), "managed"))
+    for python in _interpreters_for(found):
+        cands.append((python, "discovered"))
+    seen, uniq = set(), []
+    for path, source in cands:
+        key = _interp_key(path)  # 不 realpath，见 _interp_key
+        if key not in seen:
+            seen.add(key)
+            uniq.append((path, source))
+    return uniq
+
+
+def resolve(found: dict) -> dict:
+    """跑一遍候选链。返回
+    `{"python": str|None, "source": str|None, "tried": [...]}`；
+    `tried` 里是每个候选的 (路径, 来源, 存在与否, import 结论, 耗时 ms)。"""
+    tried: "list[dict]" = []
+    for python, source in resolver_candidates(found):
+        entry = {
+            "python": python,
+            "source": source,
+            "exists": os.path.isfile(python),
+            "importable": False,
+            "ms": 0,
+        }
+        # 「刚试过就是它」只认**同一条路径**，不 realpath（见 _interp_key）：
+        # venv 的 python 是指向基础解释器的符号链接，realpath 相同 ≠ 同一个
+        # 解释器——按 realpath 跳过会把刚 provision 好的自管环境略过不探测。
+        if entry["exists"] and _interp_key(python) != _interp_key(sys.executable):
+            t = time.monotonic()
+            entry["importable"] = _importable(python)
+            entry["ms"] = int((time.monotonic() - t) * 1000)
+        tried.append(entry)
+        if entry["importable"]:
+            return {"python": python, "source": source, "tried": tried}
+    return {"python": None, "source": None, "tried": tried}
+
+
+# ------------------------------- 诊断四态 -----------------------------------
+#: 已装插件里那份构建清单的文件名（ADR 0043）。**它是 `engine/pluginmanifest.BUILD_MANIFEST`
+#: 的镜像**：这里要诊断的恰恰是「import 不到 tavotto」的机器，跨过去读那个常量做不到，
+#: 只能把这个名字重复一遍（两侧由 tests/test_mcp_diagnose.py 对拍）。
+BUILD_MANIFEST = "plugin-build.json"
+
+#: 问引擎版本用的子命令。`tavotto doctor --json` 自 0.8.0 起就在，跑在纯标准库那一层
+#: （不 import Flask / matplotlib），而且**只读**（写安装清单要另给 `--write-manifest`）。
+#: 要问的偏偏是旧引擎，所以不能用只有新版本才认得的入口。
+_VERSION_ARGV = ("doctor", "--json")
+
+
+def required_tavotto_version() -> "str | None":
+    """本插件要求的最低引擎版本；读不到 / 形状不对回 None（= **不知道**，不是 0）。
+
+    唯一出处是构建时写进 `plugin-build.json` 的 `min_tavotto_version`，那个值来自
+    `scripts/make_plugin_manifest.MIN_TAVOTTO_VERSION`——**这里不写第二份版本号**。
+    清单是构建物，源码目录里没有：开发态一律「不知道」，诊断退回原来的三态。
+    """
+    path = os.path.join(HERE, "..", BUILD_MANIFEST)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    required = data.get("min_tavotto_version") if isinstance(data, dict) else None
+    return required if isinstance(required, str) and required.strip() else None
+
+
+def _tavotto_cli_version(cmd: "list[str]", timeout: float = 30.0) -> "str | None":
+    """这台机器上的 `tavotto` 自报的版本；问不出来回 None（= **不知道**）。
+
+    **退出码不作数**：`doctor` 发现问题时返回非 0，而那行 JSON 照样带着版本号，
+    我们要的只有 `version` 这一个字段。输出按 UTF-8 解码（子进程那侧由
+    `cli.use_utf8_streams()` 钉住），不吃这台机器的区域编码。
+    """
+    try:
+        proc = subprocess.run(
+            [*cmd, *_VERSION_ARGV],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            # 只读探测不往那个 Tavotto 所在的环境写 .pyc：`cmd` 多半是 pip / pipx 的控制台脚本，塞不进
+            # `-B`，只能靠环境变量（它起的解释器继承）
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    # 那行 JSON 在最后；旧版本可能在它前面还写了别的，所以从后往前找第一行认得的
+    for line in reversed((proc.stdout or b"").decode("utf-8", "replace").splitlines()):
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        version = data.get("version") if isinstance(data, dict) else None
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+    return None
+
+
+def _plugin_update_check():
+    """插件自带的那份版本比较（`update_check.parse_version` / `is_newer`）；
+    **import 不到就回 None**（= 不知道）。
+
+    `0.10.0 < 0.9.0` 在**字符串**序里成立，而两位数小版本正是本格的现场——版本
+    比较不在这里写第二份。
+
+    它不是第三方依赖：`update_check.py` 与 `handoff.py` 同一个目录、同属这个插件包，
+    随插件一起发行（`tests/test_mcp_diagnose.py::test_the_version_comparison_ships_
+    in_the_bundle`），而那个目录由 `_plugin_locator()` 挂上 sys.path——所以先调它，
+    这一步同时是 `diagnose()` 的第一句，import 之前一定跑过。
+
+    仍然接住 ImportError：这一句跑在**降级路径**上，异常逃出去就是 server 起不来，
+    用户看到的是「插件一个工具都没有」——比一句不精确的诊断严重得多。装残的目录
+    回「不知道」，不回崩溃。
+    """
+    _plugin_locator()
+    try:
+        import update_check  # noqa: PLC0415
+    except ImportError:
+        return None
+    return update_check
+
+
+def engine_too_old(
+    cmd: "list[str]", behind_version: "str | None" = None
+) -> "tuple[str, str] | None":
+    """这台机器上的引擎比插件要求的下限还旧吗？是则回 (它的版本, 要求的版本)。
+
+    **三环缺一就回 None**：清单里没写下限、版本问不出来、版本号解不出来——那些都是
+    「不知道」，不是「太旧」。把不知道折进这一格等于再造一个万能兜底，而 #285 的根因
+    正是有人把一条正交的轴折进了最近的那个取值。
+
+    版本有两个来源，**同一个 tavotto 的两种问法**：`behind_version` 是 CLI 背后那个
+    解释器里 `importlib.metadata` 报的版本（`engine_behind_cli`，调用方已经问过就传进来，
+    不再起第二个进程）；没有它才问 CLI 自己（`tavotto doctor --json`）。
+
+    先读清单再问 CLI，**顺序不能反**：清单是一次本地文件读，读不到就不去起 CLI
+    （降级判定有时间预算，见 tests/test_mcp_stdio.py）。
+    """
+    required = required_tavotto_version()
+    if not required:
+        return None
+    have = behind_version or _tavotto_cli_version(cmd)
+    if not have:
+        return None
+    compare = _plugin_update_check()
+    # 比不了（模块不在）与 is_newer 回 None（有一侧解不出来）都是「不知道」，不是「太旧」
+    if compare is None or compare.is_newer(required, have) is not True:
+        return None
+    return have, required
+
+
+#: `importlib.metadata` 自 3.8 起在标准库里——启动器支持的最老解释器也有它。只读分发元数据，
+#: 不 import tavotto 本身：要问的恰恰是 import 不全的那个环境。
+_DIST_VERSION = "import importlib.metadata as m; print(m.version('tavotto'))"
+
+
+def _dist_version(python: str, timeout: float = 15.0) -> "str | None":
+    """这个解释器里装的 tavotto 分发版本；没装 / 起不来 / 超时回 None（= 不知道）。"""
+    try:
+        proc = subprocess.run(
+            [python, "-B", "-c", _DIST_VERSION],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = (proc.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+    version = lines[-1].strip() if lines else ""
+    return version or None
+
+
+def engine_behind_cli(cmd: "list[str] | None") -> "dict | None":
+    """`found["cmd"]` 背后**真有一个装着 tavotto 的 Python 环境**吗？有则回
+    `{"python": 解释器, "version": 它装的 tavotto 版本}`。
+
+    这是「pip / pipx 装的引擎」与「桌面版带的 frozen `tavotto-cli`」的分界：后者背后没有
+    解释器（`_interpreters_behind` 三条都落空），一个子进程都不起。前者背后的解释器
+    resolver 已经探过、import 不全——那台机器上有引擎，只是插件驱动不了它，**不是**
+    「只装了桌面版」（#721：阿里云镜像上只有 0.15.0，pipx 装到它，插件却说「装的是桌面版」）。
+    """
+    seen = set()
+    for python in _interpreters_behind(cmd):
+        key = _interp_key(python)
+        if key in seen or not os.path.isfile(python):
+            continue
+        seen.add(key)
+        version = _dist_version(python)
+        if version:
+            return {"python": python, "version": version}
+    return None
+
+
+# ----------------------------- pip 的索引在哪 --------------------------------
+#: 绕开镜像时直连的官方索引。
+PYPI_SIMPLE = "https://pypi.org/simple"
+_PYPI_HOSTS = ("pypi.org", "www.pypi.org", "pypi.python.org")
+
+
+def _redact_url(url: str) -> str:
+    """索引地址里可能带凭据：账号口令（`https://user:token@host/simple`）、签名查询串
+    （`https://mirror/simple?token=…`）或路径里的令牌（`https://mirror/<token>/simple`）。说出口的只有
+    协议与主机（口令换成 `***@`），路径整段换成 `/***`、查询串换成 `?***`、片段去掉——路径段没有类型，
+    按词判「像不像令牌」总有漏（令牌恰好叫 `api` 也是令牌，Codex #724 P1 两轮）。判镜像只看主机，
+    说哪个镜像也只需要主机。解析不了的地址不原样交出，只报 `***`。"""
+    from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "***"
+    if parts.scheme.lower() == "file" or not parts.netloc:
+        # 本机目录当索引（`file:///home/alice/wheels`）：路径就是用户的，不出门（Codex #724）
+        return f"{parts.scheme}://***" if parts.scheme else "***"
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = "***@" + netloc.rsplit("@", 1)[1]
+    path = "/***" if parts.path.strip("/") else parts.path
+    return urlunsplit(
+        parts._replace(netloc=netloc, path=path, query="***" if parts.query else "", fragment="")
+    )
+
+
+def _is_mirror(url: str) -> bool:
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    return host not in _PYPI_HOSTS
+
+
+#: `pip_index()` 问不到 pip 时的结论：**不知道**，不猜（#737）。与「没配置」（None = 用 PyPI 默认）是两档。
+PIP_INDEX_UNKNOWN = {"url": None, "source": "unknown", "mirror": None}
+
+#: 在**目标解释器**里让 pip 自己把 `pip install` 的选项解析一遍（与真装包同一条路，不联网、不装东西），
+#: 回生效的包源（JSON 一行）。不再自己读 `pip config list`：它的打印顺序不是覆盖顺序、`config get` 不认
+#: `PIP_CONFIG_FILE`（#767 实测，两轮 Codex P1 同一个根因）。**引擎 `deprepair.PIP_OPTIONS_PROBE` 的逐字镜像**
+#: （插件 import 不到引擎；严格同源对，看护 `tests/test_pip_config_pair.py`）。
+_PIP_OPTIONS_PROBE = """\
+import json
+try:
+    import pip
+    from pip._internal.commands import create_command
+    o, _ = create_command("install").parse_args([])
+    print(json.dumps({
+        "pip_version": pip.__version__,
+        "index_url": o.index_url or "",
+        "extra_index_urls": list(o.extra_index_urls or []),
+        "no_index": bool(o.no_index),
+        "find_links": list(o.find_links or []),
+    }))
+except BaseException as e:
+    print(json.dumps({"error": type(e).__name__}))
+"""
+
+#: pip 的默认索引（引擎 `deprepair.PYPI_DEFAULT_INDEX` 的镜像）
+_PYPI_DEFAULT_INDEX = "https://pypi.org/simple"
+
+
+def parse_pip_options(text: str) -> "dict | None":
+    """`_PIP_OPTIONS_PROBE` 的输出 → 选项字典；出错 / 认不出形状回 None（= 不知道）。引擎同名函数的镜像。"""
+    import json  # noqa: PLC0415 — 只有体检路径用得到
+
+    for line in reversed((text or "").strip().splitlines()):
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(data, dict) or "error" in data or "index_url" not in data:
+            return None
+        return data
+    return None
+
+
+def options_name_a_custom_index(opts: dict) -> bool:
+    """pip 解析出的 install 选项是不是指向自定义索引：index-url 不是 PyPI 默认、或有 extra-index-url。
+    **引擎 `deprepair.options_name_a_custom_index` 的镜像**（同源对）。"""
+    index = str(opts.get("index_url") or "").strip().rstrip("/").lower()
+    return index != _PYPI_DEFAULT_INDEX.rstrip("/").lower() or bool(opts.get("extra_index_urls"))
+
+
+def _pipx_shared_python(python: str, environ) -> "str | None":
+    """pipx 共享库（`PIPX_SHARED_LIBS`，默认 `<PIPX_HOME>/shared`）里的解释器：pipx 建的 venv 默认**不带
+    pip**，它装包用的是这份共享的 pip。先认环境变量，再按 pipx 的目录形状（`<PIPX_HOME>/venvs/<名>/bin/python`
+    → `<PIPX_HOME>/shared`）找；都没有回 None。"""
+    shared = (environ.get("PIPX_SHARED_LIBS") or "").strip()
+    if not shared:
+        venv = os.path.dirname(os.path.dirname(os.path.abspath(python)))
+        venvs = os.path.dirname(venv)
+        if os.path.basename(venvs).lower() != "venvs":
+            return None
+        shared = os.path.join(os.path.dirname(venvs), "shared")
+    for rel in (("Scripts", "python.exe"), ("bin", "python"), ("bin", "python3")):
+        cand = os.path.join(shared, *rel)
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _run_probe(argv: "list[str]", environ, timeout: float) -> "str | None":
+    # 只读体检：`-B` 管住起的这个解释器，`PYTHONDONTWRITEBYTECODE` 管住 `pip --python` 再起的那个
+    env = {**environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    try:
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or b"").decode("utf-8", "replace")
+
+
+def pip_index_of(python: "str | None", environ=None, timeout: float = 15.0) -> "dict | None":
+    """**那个解释器**的 pip 从哪个索引装包——让 pip 自己在那个解释器里把 install 选项解析一遍
+    （`_PIP_OPTIONS_PROBE`，#737 / #767），不复刻 pip 的配置发现：平台位置、编码、文件覆盖顺序、
+    `PIP_CONFIG_FILE`、site 配置、Windows 商店版 Python 的虚拟化配置、`PIP_*` 环境变量，都由 pip 按它装包时的
+    规则读完。
+
+    回 `{"url": 地址（只剩协议与主机，口令 / 路径 / 查询串已抹）, "source": "PIP_INDEX_URL" | "pip_config",
+    "mirror": bool}`；没配自定义索引（index-url 是 PyPI 默认、没有 extra-index-url）回 None；**问不到**
+    （没有 pip、pip 太旧、配置解析失败、超时）回 `PIP_INDEX_UNKNOWN`——不猜。那个解释器没有 pip 时（pipx 的
+    venv 默认如此）借 pipx 共享库里的 pip：把它所在目录放上 `PYTHONPATH`、仍在**目标解释器**里解析（与
+    `pip --python` 同一个做法，site 配置跟着目标走）；再不行就是不知道。`python` 为空回 None（没有可问的）。
+    镜像滞后是 #721 的现场：阿里云镜像上只有 0.15.0，`pipx upgrade` 也升不上去。"""
+    if not python:
+        return None
+    env = dict(os.environ if environ is None else environ)
+    out = _run_probe([python, "-B", "-c", _PIP_OPTIONS_PROBE], env, timeout)
+    opts = parse_pip_options(out) if out is not None else None
+    if opts is None:
+        shared = _pipx_shared_python(python, env)
+        where = None
+        if shared:
+            where = _run_probe(
+                [
+                    shared,
+                    "-B",
+                    "-c",
+                    "import os, pip; print(os.path.dirname(os.path.dirname(os.path.abspath(pip.__file__))))",
+                ],
+                env,
+                timeout,
+            )
+        if where and where.strip():
+            out = _run_probe(
+                [python, "-B", "-c", _PIP_OPTIONS_PROBE],
+                {**env, "PYTHONPATH": where.strip().splitlines()[-1]},
+                timeout,
+            )
+            opts = parse_pip_options(out) if out is not None else None
+    if opts is None:
+        return dict(PIP_INDEX_UNKNOWN)
+    if not options_name_a_custom_index(opts):
+        return None
+    # pip 在 index-url 与每个 extra-index-url 里一起挑版本：哪个是镜像都算「指向镜像」，说出口的是那个镜像
+    # （PyPI 不通、extra 里的镜像又滞后时，照样会装回旧版——Codex #767 P2）
+    primary = str(opts.get("index_url") or "")
+    extras = [str(u) for u in (opts.get("extra_index_urls") or []) if u]
+    mirrors = [u for u in [primary, *extras] if _is_mirror(u)]
+    url = mirrors[0] if mirrors else primary
+    if url == primary:
+        source = "PIP_INDEX_URL" if (env.get("PIP_INDEX_URL") or "").strip() else "pip_config"
+    else:
+        source = (
+            "PIP_EXTRA_INDEX_URL"
+            if (env.get("PIP_EXTRA_INDEX_URL") or "").strip()
+            else "pip_config"
+        )
+    return {"url": _redact_url(url), "source": source, "mirror": bool(mirrors)}
+
+
+def pip_index(environ=None) -> "dict | None":
+    """启动器**这个**解释器的 pip 看到的索引（`pip_index_of(sys.executable)`）。"""
+    return pip_index_of(sys.executable, environ)
+
+
+def pip_index_unknown(index: "dict | None") -> bool:
+    return isinstance(index, dict) and index.get("source") == "unknown"
+
+
+def effective_pip_index(engine_python: "str | None" = None) -> "dict | None":
+    """给升级命令用的索引结论：启动器这边问到的 + 引擎背后那个解释器问到的，**任一是镜像就按镜像报**
+    ——宁可多给一个 `--index-url`（直连 PyPI 照样装得上），也不能让滞后的镜像再装回旧版；都不是镜像时
+    优先报引擎那边的，那边问不到才用这边的。"""
+    here = pip_index()
+    if not engine_python:
+        return here
+    there = pip_index_of(engine_python)
+    for cand in (there, here):
+        if cand and cand.get("mirror"):
+            return cand
+    return here if pip_index_unknown(there) else there
+
+
+def upgrade_commands(target: "str | None", index: "dict | None") -> "list[str]":
+    """把引擎升到 `target` 的命令（按仓库推荐写法：pipx + `[worker]`）。
+
+    pip 指向镜像时**不给**裸的 `pipx upgrade tavotto`——它照样去问那个镜像，升不上去；
+    每条都带上 `--index-url https://pypi.org/simple` 绕开它。
+    """
+    mirror = bool(index and index.get("mirror"))
+    idx = f" --index-url {PYPI_SIMPLE}" if mirror else ""
+    pin = f'"tavotto[worker]=={target}"' if target else '"tavotto[worker]"'
+    cmds = [] if mirror else ["pipx upgrade tavotto"]
+    cmds.append(f"pipx install --force {pin}{idx}")
+    # `--force-reinstall`：engine_incompatible 常见的是「版本号已经对、模块文件装残了」——只有 `-U` 时 pip
+    # 认为已满足、一个文件都不动（Codex #724）
+    cmds.append(f"pip install -U --force-reinstall {pin}{idx}")
+    return cmds
+
+
+#: `pip_index()` 的 `source` 是类别，不是路径（路径会进模型看得见的体检结果）；这里是给人看的说法。
+_SOURCE_LABELS = {
+    "pip_config": "pip 的配置（pip 自己解析的 install 选项）",
+    "PIP_INDEX_URL": "环境变量 PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL": "环境变量 PIP_EXTRA_INDEX_URL",
+}
+
+
+def mirror_note(target: "str | None", index: "dict | None") -> str:
+    """pip 指向镜像时补的那句；问不到 pip 时如实说不知道（不猜，#737）；不是镜像（或没配置）回空串。"""
+    want = f"到 {target}" if target else "到新版"
+    if pip_index_unknown(index):
+        return (
+            "（问不到这个环境的 pip 用哪个索引：它没有 pip，也找不到 pipx 共享的 pip。若升级后还是旧版，"
+            f"多半是镜像还没同步{want}，在命令后加 `--index-url {PYPI_SIMPLE}` 直连 PyPI 再装一次。）"
+        )
+    if not index or not index.get("mirror"):
+        return ""
+    # 版本号两侧留空格（中文里数字紧贴汉字会读成一个词）；没有版本号时说「新版」
+    return (
+        f"注意：pip 的索引指向镜像 {index['url']}（来自 {_SOURCE_LABELS.get(index['source'], index['source'])}），"
+        f"镜像可能还没同步{want}，照常升级只会再装回镜像上那一版——命令里的 "
+        f"`--index-url {PYPI_SIMPLE}` 就是为此绕开镜像直连 PyPI。"
+    )
+
+
+def engine_too_old_hint(
+    have: str, required: str, plugin: "str | None" = None, index: "dict | None" = None
+) -> str:
+    """`engine_too_old` 的话术：**两个版本号都要说出口**，外加能照抄的升级命令。
+
+    「你的引擎太旧了」里没有用户能执行的东西——他要知道自己现在是哪一版、这个插件
+    要的是哪一版，才判断得出该升引擎还是该把插件退回去。
+    """
+    # 版本号两侧都要留空格：中文里数字紧贴汉字会读成一个词（实测「插件 0.13.0需要」）
+    who = f"插件 {plugin} 需要" if plugin else "这个插件需要"
+    cmds = upgrade_commands(required, index)
+    return (
+        f"这台机器上的 Tavotto 是 {have}，而{who} {required} 或更新的引擎："
+        f"桥要 import 的那组引擎模块在 {have} 里还没有，所以宿主里的内嵌画布与整组"
+        "工具都起不来（交接——把图交给 Tavotto 窗口打开——不受影响，那条路只要求 CLI "
+        "能执行）。恢复：**升级引擎**（"
+        + "，或 ".join(f"`{c}`" for c in cmds)
+        + "；桌面版用户升级桌面版），或者反过来把插件退回与这台引擎匹配的那一版。"
+        + mirror_note(required, index)
+        + "（"
+        + RELOAD_HINT
+        + "。）"
+    )
+
+
+def python_location(python: "str | None") -> str:
+    """引擎装在**哪一类**环境里（pipx / venv / 解释器本身）——不报路径：体检与降级诊断进模型看得见的
+    `tavotto_health`，用户目录下的绝对路径不出门（Codex #724 P1，同 `pip_index` 的 `source`）。"""
+    if not python:
+        return "一个说不出位置的环境"
+    parts = {p.lower() for p in python.replace("\\", "/").split("/") if p}
+    if "pipx" in parts:
+        return "pipx 的 tavotto 环境"
+    root = os.path.dirname(os.path.dirname(python))
+    if os.path.isfile(os.path.join(root, "pyvenv.cfg")):
+        return "一个虚拟环境（venv）"
+    return "一个 Python 解释器（装在它自己的 site-packages 里）"
+
+
+def _found_engine_public(engine: dict) -> dict:
+    """说出口的「找到的那个引擎」：版本 + 环境类别，没有路径。"""
+    return {"version": engine.get("version"), "where": python_location(engine.get("python"))}
+
+
+def engine_incompatible_hint(
+    engine: dict, plugin: "str | None" = None, index: "dict | None" = None
+) -> str:
+    """`engine_incompatible`：引擎**在**（pip / pipx 装的，背后有解释器、有版本号），桥却
+    import 不全，而「是不是太旧」说不出——插件没带构建清单（本地市场 / 源码目录装的），或
+    版本不低于下限却照样 import 不全（装残了）。不知道是独立一档：不说「太旧」，更不说
+    「装的是桌面版」。恢复方向与太旧相同：把引擎装成与插件同一版（插件版本 == 引擎版本）。
+    """
+    # 版本号两侧都要留空格（真机上看到过「插件 0.17.0的桥」）：空格随版本号走，
+    # 没有版本号时「这个插件的桥」不该多出一个空格
+    who = f"插件 {plugin} " if plugin else "这个插件"
+    cmds = upgrade_commands(plugin, index)
+    return (
+        f"这台机器上装着 Tavotto 引擎 {engine['version']}（在{python_location(engine.get('python'))}里），"
+        f"但{who}的桥要 import 的那组引擎模块它 import 不全，所以宿主里的内嵌画布与整组"
+        "工具都起不来。多半是这个引擎比插件旧，也可能是装残了（这份插件说不出它要求的"
+        "最低引擎版本）。这不是「只装了桌面版」，交接照常能用。恢复：把引擎装成与插件"
+        "同一版（"
+        + "，或 ".join(f"`{c}`" for c in cmds)
+        + "）。"
+        + mirror_note(plugin, index)
+        + "（"
+        + RELOAD_HINT
+        + "。）"
+    )
+
+
+def diagnosis(found: dict) -> dict:
+    """`diagnose()` 的完整形态：`{"code", "hint", "engine"}`，`engine` 是 CLI 背后找到的
+    那个引擎（`engine_behind_cli`，没有则 None）——体检与降级 payload 要把版本说出口。"""
+    handoff = _plugin_locator()
+    if found.get("cmd"):
+        engine = engine_behind_cli(found["cmd"])
+        too_old = engine_too_old(found["cmd"], behind_version=(engine or {}).get("version"))
+        if too_old is not None or engine is not None:
+            # 升级命令要不要绕开镜像，以**装着引擎的那个解释器**看到的 pip 配置为准
+            index = effective_pip_index((engine or {}).get("python"))
+        if too_old is not None:
+            return {
+                "code": "engine_too_old",
+                "hint": engine_too_old_hint(*too_old, plugin=_plugin_version(), index=index),
+                "engine": engine or {"python": None, "version": too_old[0]},
+                "index": index,
+            }
+        if engine is not None:
+            return {
+                "code": "engine_incompatible",
+                "hint": engine_incompatible_hint(engine, plugin=_plugin_version(), index=index),
+                "engine": engine,
+                "index": index,
+            }
+        return {"code": "desktop_only", "hint": DESKTOP_ONLY_HINT, "engine": None}
+    if found.get("desktop"):
+        return {"code": "desktop_found_cli_missing", "hint": handoff.UPGRADE_HINT, "engine": None}
+    return {"code": "tavotto_missing", "hint": handoff.INSTALL_HINT, "engine": None}
+
+
+def diagnose(found: dict) -> "tuple[str, str]":
+    """定位结果 + 找不到解释器 → (机器可读 code, 说人话的 hint)。
+
+    五态互斥，**不许混成一句「没装 Tavotto」**：
+      tavotto_missing            真没装
+      desktop_found_cli_missing  桌面版装了，但那一版没带 tavotto-cli（旧安装）
+      desktop_only               装的是桌面版：交接能用，但 MCP 要 Python 环境
+      engine_too_old             装了，但那个引擎比插件要求的下限还旧（#285）
+      engine_incompatible        装了 pip 形态的引擎（CLI 背后有解释器、有版本），桥却
+                                 import 不全，而说不出它是不是太旧（#721）
+    显式指了解释器却用不了的另算：engine_unavailable（见 `diagnose_resolved`）。
+
+    **判别顺序：窄的先判、宽的兜底。** 这三格（`engine_too_old` / `engine_incompatible` /
+    `desktop_only`）的前提是同一个（`found["cmd"]` 有东西），而 `desktop_only` 只问
+    「PATH / 安装位置上有没有 tavotto」——它是最宽的那一格，排在前面就会把每一个更窄的
+    答案吃掉。#285 就是这么来的：`pip install tavotto==0.10` 的用户被告知「这台机器上装的
+    是 Tavotto 桌面版」；#721 是它的另一半：插件没带构建清单时「太旧」判不出来，于是
+    pipx 装的 0.15.0 又落回「桌面版」。`desktop_only` 现在只收 CLI 背后**没有**装着
+    tavotto 的解释器的那种安装（frozen 的 `tavotto-cli`）。
+
+    反过来，它们排在 `engine_unavailable`（在 `diagnose_resolved` 里）**后面**：用户显式
+    设了 `TAVOTTO_MCP_PYTHON` 却用不了时，该修的是那个变量，与 PATH 上那个 tavotto 是
+    哪一版无关——先报版本会把他支去升级一个可能完全够用的引擎。
+    """
+    d = diagnosis(found)
+    return d["code"], d["hint"]
+
+
+def diagnose_resolved(found: dict, resolution: dict) -> "tuple[str, str]":
+    """带上 resolver 结论的完整诊断（`diagnosis_resolved` 的 (code, hint) 形态）。"""
+    d = diagnosis_resolved(found, resolution)
+    return d["code"], d["hint"]
+
+
+def diagnosis_resolved(found: dict, resolution: dict) -> dict:
+    """带上 resolver 结论的完整诊断。
+
+    用户**显式指定**的解释器（TAVOTTO_MCP_PYTHON）用不了时，必须报
+    `engine_unavailable` 并指名道姓——静默落到「桌面版」那格，用户改了半天
+    桌面安装，问题其实在他自己设的那个变量上。
+    """
+    override = next((t for t in resolution["tried"] if t["source"] == "mcp_env"), None)
+    if override is not None and not override["importable"]:
+        why = (
+            "指向的文件不存在"
+            if not override["exists"]
+            else "import tavotto.engine 失败（那个环境里没装 tavotto）"
+        )
+        return {
+            "code": "engine_unavailable",
+            "hint": f"{MCP_PYTHON_ENV} 指定的解释器用不了：{override['python']}"
+            f"（{why}）。修正它，或者去掉这个变量让 resolver 自己找；"
+            f"装引擎可用 `{_self_command()} --provision`。"
+            "（" + RELOAD_HINT + "。）",
+            "engine": None,
+        }
+    if managed_runtime_stale(resolution):
+        return {"code": "managed_runtime_stale", "hint": MANAGED_STALE_HINT, "engine": None}
+    return diagnosis(found)
+
+
+#: 自管环境在、却 import 不过这一版插件要的引擎——插件升级之后最常见的形状：
+#: `codex plugin marketplace upgrade` 换掉了插件目录，而 `mcp-runtime/venv` 在
+#: 配置目录里原样留着上一版引擎（#487：0.14.0 的环境撞上 0.15.0 的桥）。
+MANAGED_STALE_HINT = (
+    "插件自管环境里的引擎跟当前插件对不上（多半是插件升级后环境还是旧版）。"
+    "把它重装到插件对应的版本即可：python3 <插件目录>/mcp/server.py --provision，"
+    "装完**新开一次 Codex 会话**。"
+)
+#: 启动器真的在后台起了重装时，降级模式对用户说的那句（只有 main() 起了才用它）。
+MANAGED_STALE_KICKED_HINT = (
+    "插件自管环境里的引擎跟当前插件对不上（多半是插件升级后环境还是旧版）。"
+    "启动器已在后台把它重装到插件对应的版本，通常一两分钟；装完**新开一次 Codex 会话**"
+    "即可使用。后台没装成时手动跑：python3 <插件目录>/mcp/server.py --provision"
+)
+
+
+def managed_runtime_stale(resolution: dict) -> bool:
+    """自管 venv 的解释器**在**、却 import 不过 `_BRIDGE_IMPORT`。
+
+    只认 resolver 真的探过的那一条（`source == "managed"` 且 exists），不按文件名猜：
+    环境不存在是 `tavotto_missing` / `desktop_only` 那几格的事，不是「旧了」。
+    """
+    return any(
+        t["source"] == "managed" and t["exists"] and not t["importable"]
+        for t in resolution.get("tried", [])
+    )
+
+
+#: 关掉启动时的后台自动重装（测试、或不想让启动器联网的用户）。
+NO_AUTO_PROVISION_ENV = "TAVOTTO_MCP_NO_AUTO_PROVISION"
+
+
+def _provision_lock_path() -> str:
+    return os.path.join(managed_runtime_dir(), "provision.lock")
+
+
+def _try_lock_fd(fd: int) -> bool:
+    """在 fd 上非阻塞地拿**内核**排他锁：拿到 True，别人持有 False。
+
+    用操作系统的文件锁而不是「锁文件 + mtime + 令牌」（#548 Codex 评审，多轮）：
+    持有者无论正常结束、崩溃还是被杀，内核都在它退出时释放锁——没有「过期锁」，
+    也就不需要接管、心跳、令牌，那一整套「核对所有权再改」在纯文件语义下永远
+    不是原子的。POSIX 用 `flock`（按打开的文件描述，同进程两个 fd 也互斥），
+    Windows 用 `msvcrt.locking` 锁第 0 字节（文件为空也能锁）。
+    只有**被占用**才回 False；锁子系统自己的错（ENOLCK、EIO、文件系统不支持锁……）
+    照常抛 OSError——当成「别人在装」会让手动与自动修复永远原地等一个不存在的持有者
+    （#548 评审 P2）。"""
+    import errno
+
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as exc:
+            # 被别的句柄锁着时 CRT 报 EACCES（部分版本 EDEADLOCK）
+            if exc.errno in (errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK)):
+                return False
+            raise
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        # flock 的约定里「被占用」可以是 EWOULDBLOCK / EAGAIN，也可以是 EACCES
+        # （部分实现 / fcntl 模拟的 flock）——只认这几个，ENOLCK、EIO 等照常抛
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+            return False
+        raise
+
+
+def _acquire_provision_lock() -> "int | None":
+    """拿重装锁：拿到回持锁的 fd（关掉它 / 进程退出即释放），别人持有回 None。
+    打不开锁文件（EMFILE、只读盘……）照常抛 OSError，由调用方报出来。"""
+    os.makedirs(managed_runtime_dir(), exist_ok=True)
+    fd = os.open(_provision_lock_path(), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        held = _try_lock_fd(fd)
+    except OSError:
+        os.close(fd)
+        raise
+    if held:
+        return fd
+    os.close(fd)
+    return None
+
+
+def _running_executable_is_locked() -> bool:
+    """正在跑的解释器文件删不掉（Windows）；POSIX 上 unlink 正在跑的文件没问题。"""
+    return os.name == "nt"
+
+
+def _running_from_managed_venv() -> bool:
+    venv = os.path.normcase(os.path.abspath(os.path.join(managed_runtime_dir(), "venv")))
+    exe = os.path.normcase(os.path.abspath(sys.executable or ""))
+    return exe.startswith(venv + os.sep)
+
+
+def _release_provision_lock(fd: "int | None") -> None:
+    if fd is None:
+        return
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    try:
+        os.close(fd)  # POSIX 上关 fd 即释放 flock
+    except OSError:
+        pass
+
+
+def kick_background_provision() -> dict:
+    """在后台起一次 `--provision`，把自管环境重装到插件版本（#487）。
+
+    **不在启动路径上同步跑 pip**：Codex 给 MCP server 的启动预算是
+    `startup_timeout_sec`（30 s），联网装一遍科学栈可能远超它——同步跑的结果是
+    host 判启动失败、连降级 server 都没有。所以这里只 spawn 一个脱离本进程的
+    子进程，本次会话照常以降级模式回话、把「正在后台升级」说出口；装完下一次
+    新会话就是正常模式。
+
+    这里只**探一下**锁（拿到立刻放）来省掉明显多余的 spawn；真正的互斥在子进程
+    `--provision` 里——它改环境之前自己拿内核锁，拿不到就不动环境。所以几个会话
+    同时起、各自探到空闲而各起一个子进程也无妨：只有一个会真的跑 pip。
+    返回 `{"started": bool, "reason": str, "log": path}`，进 health 与降级 payload。
+    """
+    root = managed_runtime_dir()
+    log = os.path.join(root, "provision.log")
+    if os.environ.get(NO_AUTO_PROVISION_ENV) == "1":
+        return {"started": False, "reason": "disabled", "log": log}
+    if (
+        _running_executable_is_locked()
+        and _running_from_managed_venv()
+        and not _python_supported(tuple(sys.version_info[:2]))
+    ):
+        # 本 server 正跑在这个自管 venv 的 python.exe 上，而它的版本在区间外——
+        # --provision 要 `venv --clear` 整个重建，Windows 删不掉正在跑的 python.exe，
+        # 每次启动都会失败一遍（#548 评审 P2）。不起，明确说要退出 Codex 后手动重建。
+        # launch.cmd 只在区间内才优先用自管 venv，所以只有机器上别无 Python 时才走到这。
+        return {"started": False, "reason": "venv_in_use", "log": log}
+    try:
+        probe = _acquire_provision_lock()
+    except OSError as exc:
+        return {"started": False, "reason": f"lock_failed: {exc}", "log": log}
+    if probe is None:
+        return {"started": False, "reason": "already_running", "log": log}
+    _release_provision_lock(probe)
+    try:
+        out = open(log, "a", encoding="utf-8")
+    except OSError as exc:
+        return {"started": False, "reason": f"cannot_write: {exc}", "log": log}
+    kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": out, "stderr": out}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    else:
+        kwargs["start_new_session"] = True  # host 关掉本 server 时不连带杀掉 pip
+    env = dict(os.environ)
+    env.pop(_EXECED_ENV, None)
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--provision"], env=env, **kwargs
+        )
+    except OSError as exc:
+        return {"started": False, "reason": f"spawn_failed: {exc}", "log": log}
+    finally:
+        out.close()
+    return {"started": True, "reason": "stale_managed_runtime", "log": log}
+
+
+# ------------------------------- 降级 server --------------------------------
+#: 正常模式下 `tavotto_health` 之外的全部工具名。降级模式**不把它们列进
+#: tools/list**（列了就是伪装成可用），但对着旧会话里模型记住的名字调用时，
+#: 回结构化错误而不是 method_not_found——错误里说清缺什么、怎么修。
+NORMAL_TOOLS = (
+    "tavotto_open_figure",
+    "tavotto_apply_overrides",
+    "tavotto_normalize_figure",
+    "tavotto_preflight",
+    "tavotto_export",
+    "tavotto_verify_replay",
+    "tavotto_refresh_project",
+    "tavotto_session_state",
+    "tavotto_close_session",
+)
+
+
+#: 恢复步骤（结构化，降级 server 与 --health 共用一份）
+_UNSET = object()
+
+
+def _recovery_steps(code: str, index=_UNSET) -> "list[str]":
+    """`index` 是诊断时已经得出的索引结论（`diagnosis()["index"]`）；没给才就地读一次。"""
+    steps = []
+    if code in ("engine_too_old", "engine_incompatible"):
+        # 这两格的用户**已经装了**引擎，缺的不是「一个环境」而是「对得上的版本」。
+        # 给 `--provision` 会让他在旁边再建一个环境，原来那个照样旧——一台装了两份
+        # tavotto 的机器比一台装旧了的机器更难查。目标版本：太旧那格是清单里的下限，
+        # 说不出下限的那格是插件自己的版本（插件版本 == 引擎版本）。两个都是本地文件读。
+        target = (
+            required_tavotto_version() if code == "engine_too_old" else None
+        ) or _plugin_version()
+        if index is _UNSET:
+            index = pip_index()
+        steps.append(
+            "升级引擎：" + "，或 ".join(upgrade_commands(target, index)) + "；桌面版用户升级桌面版"
+        )
+        note = mirror_note(target, index)
+        if note:
+            steps.append(note)
+        steps.append("或者反过来：把插件退回与这台机器上的引擎匹配的那一版")
+    elif code == "managed_runtime_stale":
+        # 缺的不是「一个环境」，是**这个**环境跟插件对不上：启动时 main() 会在后台
+        # 重装它，用户要做的只有等它装完、新开会话。手动那条留作兜底（离线 / 后台失败）。
+        steps.append(
+            "Codex 启动本插件时，启动器会在后台把自管环境重装到插件对应的版本（日志："
+            "<Tavotto 配置目录>/mcp-runtime/provision.log），通常一两分钟"
+        )
+        steps.append("没装成（离线等）或想立刻修好：python3 <插件目录>/mcp/server.py --provision")
+    elif code in (
+        "desktop_only",
+        "engine_unavailable",
+        "tavotto_missing",
+        "desktop_found_cli_missing",
+    ):
+        steps.append(
+            f"方式一（推荐，零配置）：{_self_command()} --provision"
+            "  （在 Tavotto 配置目录下建插件自管环境，不碰系统 Python）"
+        )
+        steps.append(
+            "方式二：pipx install tavotto（或 pip install tavotto），"
+            "或把 TAVOTTO_MCP_PYTHON 指到一个装了 tavotto 的解释器"
+        )
+    steps.append(RELOAD_HINT + "（这一步最容易漏）")
+    steps.append(f"自检：{_self_command()} --health")
+    return steps
+
+
+def _degraded_payload(code: str, hint: str, resolution: "dict | None") -> dict:
+    if resolution and "pip_index" in resolution:
+        index = resolution["pip_index"]
+    elif code in ("engine_too_old", "engine_incompatible"):
+        index = pip_index()
+    else:
+        index = None
+    return {
+        "ok": False,
+        "code": code,
+        "error": hint,
+        "engine": {
+            "available": False,
+            "missing": "一个能 import tavotto.engine 的 Python 解释器",
+            # 引擎**在**、只是版本对不上时（engine_too_old / engine_incompatible），
+            # 把找到的那个说出口：{"python", "version"}
+            **(
+                {"found": _found_engine_public(resolution["found_engine"])}
+                if resolution and resolution.get("found_engine")
+                else {}
+            ),
+        },
+        # pip 从哪个索引装包（只读探测；镜像滞后时升级命令要绕开它，#721）
+        "pip_index": index,
+        "canvas": {
+            "available": False,
+            "reason": "内嵌画布跑在 MCP server 里，引擎不可用时它也"
+            "不可用。桌面窗口 / 浏览器**不是**内嵌画布的替代品。",
+        },
+        "unavailable_tools": list(NORMAL_TOOLS),
+        "recovery": _recovery_steps(code, index),
+        "tried": (resolution or {}).get("tried", []),
+        **(
+            {"auto_provision": resolution["auto_provision"]}
+            if resolution and "auto_provision" in resolution
+            else {}
+        ),
+    }
+
+
+def _degraded_server(
+    code: str, hint: str, resolution: "dict | None" = None, stdin=None, stdout=None
+) -> int:
+    """跑不起来时的降级 server。
+
+    * 能握手（initialize / ping），serverInfo.version 固定 "0"——健康的
+      server 报的是 tavotto 版本号，这个 0 就是「引擎不在」的显性信号；
+    * tools/list **只列 `tavotto_health`**——它是唯一真的可用的工具；
+    * 六个正常工具名的调用回 `isError` + 结构化 code——**绝不回「画布已
+      打开」之类的成功**；
+    * 不声明 resources——没有引擎就没有画布，声明了就是给 host 一个白框。
+    """
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    if hasattr(stdout, "reconfigure"):
+        try:
+            stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+    payload = _degraded_payload(code, hint, resolution)
+    health_tool = {
+        "name": "tavotto_health",
+        "title": "Tavotto 健康检查",
+        "description": (
+            "诊断 Tavotto MCP 的当前状态：引擎在不在、缺什么、"
+            "怎么恢复。当前引擎不可用（" + code + "），其余工具"
+            "暂不提供。"
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    }
+
+    def send(obj):
+        stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        stdout.flush()
+
+    for raw in stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            continue
+        rid, method = msg.get("id"), msg.get("method")
+        if rid is None:
+            continue
+        if method == "initialize":
+            want = msg.get("params", {}).get("protocolVersion")
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "result": {
+                        "protocolVersion": want if isinstance(want, str) else "2025-11-25",
+                        "capabilities": {"tools": {"listChanged": False}},
+                        "serverInfo": {"name": "tavotto", "version": "0"},
+                        "instructions": f"[{code}] {hint}",
+                    },
+                }
+            )
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [health_tool]}})
+        elif method == "tools/call":
+            name = (msg.get("params") or {}).get("name")
+            if name == "tavotto_health":
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    # code 只留在 structuredContent 里：这段是
+                                    # 念给用户听的。
+                                    "text": hint
+                                    + "\n恢复步骤：\n- "
+                                    + "\n- ".join(payload["recovery"]),
+                                }
+                            ],
+                            "structuredContent": payload,
+                        },
+                    }
+                )
+            elif name in NORMAL_TOOLS:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "result": {
+                            "isError": True,
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": hint
+                                    + "\n恢复步骤：\n- "
+                                    + "\n- ".join(payload["recovery"]),
+                                }
+                            ],
+                            "structuredContent": payload,
+                        },
+                    }
+                )
+            else:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "error": {"code": -32601, "message": f"没有这个工具: {name}"},
+                    }
+                )
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        elif method in ("resources/list", "resources/templates/list"):
+            key = "resources" if method == "resources/list" else "resourceTemplates"
+            send({"jsonrpc": "2.0", "id": rid, "result": {key: []}})
+        else:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "error": {"code": -32601, "message": f"不支持的方法: {method}"},
+                }
+            )
+    return 0
+
+
+# ------------------------------- 体检与自建 ---------------------------------
+def health() -> "tuple[dict, int]":
+    """`--health`：一行 JSON 说清现状。退出码 0 = 引擎可用。"""
+    t0 = time.monotonic()
+    current_ok = _current_engine_ok()
+    handoff = _plugin_locator()
+    found = handoff.find_tavotto()
+    widget_file = os.path.join(HERE, "widget", "canvas.html")
+    report: dict = {
+        "ok": False,
+        "mode": "degraded",
+        "desktop": {
+            "cli": (found.get("cmd") or [None])[0],
+            "source": found.get("source"),
+            "desktop": found.get("desktop"),
+        },
+        "widget": {
+            "available": os.path.isfile(widget_file) and os.path.getsize(widget_file) > 0,
+            "path": widget_file,
+        },
+        "managed_runtime": {
+            "python": managed_python(),
+            "present": os.path.isfile(managed_python()),
+        },
+        "notes": [
+            "engine 可用但宿主里还是没有工具？" + RELOAD_HINT + "。Codex 的"
+            " `codex plugin list` 里 enabled、其他宿主里「已登记」都不代表 server 健康。",
+        ],
+    }
+    if current_ok:
+        import tavotto
+
+        report.update(
+            ok=True,
+            mode="engine",
+            python=sys.executable,
+            source="current",
+            engine_version=tavotto.__version__,
+        )
+        report["tried"] = [
+            {
+                "python": sys.executable,
+                "source": "current",
+                "exists": True,
+                "importable": True,
+                "ms": 0,
+            }
+        ]
+    else:
+        resolution = resolve(found)
+        report["tried"] = [
+            {
+                "python": sys.executable,
+                "source": "current",
+                "exists": True,
+                "importable": False,
+                "ms": 0,
+            }
+        ] + resolution["tried"]
+        if resolution["python"]:
+            report.update(
+                ok=True, mode="engine", python=resolution["python"], source=resolution["source"]
+            )
+            try:
+                proc = subprocess.run(
+                    [
+                        resolution["python"],
+                        "-B",
+                        "-c",
+                        "import tavotto; print(tavotto.__version__)",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                report["engine_version"] = (proc.stdout or "").strip() or None
+            except (OSError, subprocess.TimeoutExpired):
+                report["engine_version"] = None
+        else:
+            diag = diagnosis_resolved(found, resolution)
+            code, hint = diag["code"], diag["hint"]
+            report.update(
+                code=code, error=hint, recovery=_recovery_steps(code, diag.get("index", _UNSET))
+            )
+            if "index" in diag:
+                report["pip_index"] = diag["index"]
+            if diag.get("engine"):
+                # 引擎在、只是版本对不上：版本与下限都说出口（`tavotto codex doctor` 读这两个字段）
+                report["engine_version"] = diag["engine"].get("version")
+                report["engine_where"] = python_location(diag["engine"].get("python"))
+                report["min_tavotto_version"] = required_tavotto_version()
+            # 恢复步骤第一条是 --provision：先替它把「拿什么建 venv」探一遍，让读体检
+            # 的人（多半是模型）看得到「启动器是 3.9、但机器上有 3.13 可用」这一行，
+            # 而不是等 pip 的那句 "No matching distribution found" 再来猜。
+            base, tried = find_venv_base()
+            report["provision"] = {
+                "launcher_python": sys.executable,
+                "launcher_version": f"{sys.version_info[0]}.{sys.version_info[1]}",
+                "python_range": python_range_text(),
+                "base": base,
+                "tried": tried,
+            }
+            if base is None:
+                report["notes"].append(
+                    f"这台机器上没有 Python {python_range_text()} 的解释器，--provision 会以"
+                    " no_supported_python 失败：先装一个（或走 pipx）。"
+                )
+    # pip 从哪个索引装包（只读：环境变量 + pip 配置文件）。引擎要升级时，镜像滞后会让
+    # 照常的升级命令装回旧版——读体检的一侧（`tavotto codex doctor`）据此给绕开写法（#721）
+    if "pip_index" not in report:
+        # 解析到的引擎解释器不是启动器自己时，那边的 pip 配置（`pip config --site` 配在引擎 venv 里的
+        # 镜像）也要问——与降级那一路同一个 `effective_pip_index`（Codex #724）
+        engine_py = report.get("python")
+        report["pip_index"] = effective_pip_index(
+            engine_py if engine_py and engine_py != sys.executable else None
+        )
+    report["timings"] = {"health_ms": int((time.monotonic() - t0) * 1000)}
+    return report, (0 if report["ok"] else 3)
+
+
+def _plugin_version() -> "str | None":
+    manifest = os.path.join(HERE, "..", ".codex-plugin", "plugin.json")
+    try:
+        with open(manifest, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    version = data.get("version") if isinstance(data, dict) else None
+    return version if isinstance(version, str) and version.strip() else None
+
+
+def provision(spec: "str | None" = None, python_base: "str | None" = None) -> "tuple[dict, int]":
+    """`--provision`：建插件自管 venv 并装引擎（钉在插件版本上，可复现）。
+
+    * 只写 Tavotto 配置目录下的 `mcp-runtime/`——**绝不动**系统 Python、
+      Conda、用户 site-packages、shell 配置；pip 的缓存也在这里
+      （`mcp-runtime/cache/pip`，`provision_env()`，#733）；
+    * **基础解释器先验版本再建 venv**（`find_venv_base()`）：启动本文件的
+      `python3` 不一定在引擎的支持区间里（macOS 上它常是 Xcode CLT 的 3.9），
+      venv 会原样继承它的版本，然后 pip 只会说一句 "No matching distribution
+      found"。区间外就换一个候选；一个都没有就以 `no_supported_python` 失败并把
+      每个候选的版本说出口——**不在区间外的解释器上起 pip**。上一次在区间外
+      解释器上建出来的 venv 也照此重建（`venv --clear`）。`--python` 显式指定
+      时只认它一个：先验它，已有的 venv 也换到它上面，指错了如实报错；
+    * 默认装 `tavotto[worker]==<插件版本>`（版本与插件同步发版；`[worker]`
+      带上 matplotlib/numpy——pip 形态的引擎发现不了桌面 App 里的内置
+      runtime，自管环境不自带渲染栈的话，没有科学栈的机器上 open 第一步
+      就会倒在「找不到渲染解释器」，零配置就落空了）；`--from` 可指
+      wheel 文件 / 源码目录 / 任意 pip requirement（离线或开发态用）；
+    * 装完**验证** `import tavotto.engine`，验证不过就如实失败——半成品
+      环境比没有环境更难查。
+    """
+    t0 = time.monotonic()
+    if spec is None:
+        version = _plugin_version()
+        spec = f"tavotto[worker]=={version}" if version else "tavotto[worker]"
+    root = managed_runtime_dir()
+    venv_dir = os.path.join(root, "venv")
+    python = managed_python()
+    steps: "list[dict]" = []
+    env = provision_env()  # pip 缓存落在 mcp-runtime 自己旁边，不在用户的 pip 默认位置（#733）
+
+    def _run(argv, what):
+        t = time.monotonic()
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=900, env=env)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            steps.append({"step": what, "ok": False, "error": str(exc)})
+            return False
+        steps.append(
+            {
+                "step": what,
+                "ok": proc.returncode == 0,
+                "ms": int((time.monotonic() - t) * 1000),
+                "tail": (proc.stderr or proc.stdout or "").strip().splitlines()[-5:],
+            }
+        )
+        return proc.returncode == 0
+
+    os.makedirs(root, exist_ok=True)
+    # 已有的 venv 也要验：它继承了当年那个基础解释器的版本。区间外 / 已坏就重建，
+    # 否则用户删目录之前每次重跑都撞同一堵墙。
+    existing = _probe_python([python]) if os.path.isfile(python) else None
+    venv_version = existing["version"] if existing else None
+    # 显式 --python 就是「用这个建」：已有的 venv 在不在区间内都不算数，先验它、再换到它
+    # 上面——否则指错了也会静默沿用旧环境报成功（#453 评审 P2）
+    if python_base or not _python_supported(venv_version):
+        base, tried = find_venv_base(python_base)
+        steps.append({"step": "base", "ok": base is not None, "python": base, "tried": tried})
+        if base is None:
+            listed = "；".join(
+                f"{t['python']} 是 {t['version']}" if t["version"] else f"{t['python']} 起不来"
+                for t in tried
+            )
+            return (
+                {
+                    "ok": False,
+                    "code": "no_supported_python",
+                    "steps": steps,
+                    "tried": tried,
+                    "error": (
+                        f"这台机器上找不到 Python {python_range_text()} 的解释器来建自管环境"
+                        f"（{listed}），而 {spec} 只装得进这个区间。"
+                    ),
+                    "recovery": [
+                        f"装一个 Python {python_range_text()}（python.org 安装包、"
+                        "`brew install python@3.13`、`winget install Python.Python.3.13`），"
+                        "然后重跑同一条 --provision（它会自己找到新装的那个）",
+                        "或者用 --python <解释器路径> 明确指一个",
+                        '或者 pipx install "tavotto[worker]"（pipx 自己管解释器）',
+                    ],
+                },
+                1,
+            )
+        argv = [base, "-m", "venv"]
+        if os.path.isdir(venv_dir):
+            argv.append("--clear")  # 上一次在区间外解释器上建的：整个换掉，不在旧壳上叠
+        argv.append(venv_dir)
+        if not _run(argv, "venv"):
+            return (
+                {
+                    "ok": False,
+                    "code": "provision_failed",
+                    "steps": steps,
+                    "error": f"建不出 venv（基础解释器 {base}）",
+                },
+                1,
+            )
+        # venv 继承基础解释器的版本；它能不能用由下面的 `_importable` 验，不再探一次
+        venv_version = tuple(int(x) for x in tried[-1]["version"].split("."))
+    if not _run([python, "-m", "pip", "install", "--upgrade", spec], "pip"):
+        # 走到这里基础解释器已经验过在区间内，所以剩下的多半是索引侧：离线、或 pip
+        # 镜像还没同步这一版（新版发出当天在国内镜像上常见）。
+        version_text = f"{venv_version[0]}.{venv_version[1]}" if venv_version else "?"
+        return (
+            {
+                "ok": False,
+                "code": "provision_failed",
+                "steps": steps,
+                "error": (
+                    f"pip install {spec} 失败。基础解释器是 Python {version_text}，在支持"
+                    "区间内，所以不是版本问题——多半是离线，或 pip 镜像还没同步这一版："
+                    "设 PIP_INDEX_URL=https://pypi.org/simple 后重跑，"
+                    "或给 --from 指一个本地 wheel / 源码目录"
+                ),
+            },
+            1,
+        )
+    if not _importable(python):
+        return (
+            {
+                "ok": False,
+                "code": "provision_failed",
+                "steps": steps,
+                "error": "装完仍 import 不了 tavotto.engine——环境是半成品，"
+                "删掉 mcp-runtime 目录后重试",
+            },
+            1,
+        )
+    python_version = f"{venv_version[0]}.{venv_version[1]}" if venv_version else None
+    marker = {
+        "spec": spec,
+        "python": python,
+        "python_version": python_version,
+        "provisioned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        with open(os.path.join(root, "provision.json"), "w", encoding="utf-8") as fh:
+            json.dump(marker, fh, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+    return (
+        {
+            "ok": True,
+            "python": python,
+            "python_version": python_version,
+            "spec": spec,
+            "steps": steps,
+            "ms": int((time.monotonic() - t0) * 1000),
+            "next": RELOAD_HINT,
+        },
+        0,
+    )
+
+
+#: 交棒方式看平台（测试可替换）。
+_IS_WINDOWS = os.name == "nt"
+
+
+def _hand_off(python: str, argv: "list[str]") -> int:
+    """把这个进程交给装着引擎的解释器。
+
+    * POSIX：`os.execv`——同一个进程，stdio 原样继承，host 察觉不到换过人（也不用管
+      转发与信号）。
+    * Windows：`os.execv` 是用 spawn 模拟的，而且**不给参数加引号**：路径里一有空格
+      （`C:\\Users\\John Smith\\…`、带空格的解压目录）就被拆开，引擎解释器去打开半截路径，
+      退出码 0、一个协议帧都没有（#559 的 Windows CI 由 configure 的握手探针撞出来）。
+      所以改为子进程：参数按列表传（subprocess 负责逐个加引号），stdio 继承，等它结束并
+      原样带回退出码——父进程一直活着，host 看到的管道也就一直在。
+    """
+    args = [python, os.path.abspath(__file__), *argv]
+    if _IS_WINDOWS:
+        return subprocess.call(args)
+    os.execv(python, args)
+    return 0  # 走不到：execv 成功就不返回，失败抛 OSError
+
+
+# --------------------------------- 主入口 -----------------------------------
+def _utf8_stdio() -> None:
+    """体检 / provision 的那一行 JSON 固定按 UTF-8 写（读它的一侧——`tavotto codex install`、
+    `integrations/configure.py`——都按 UTF-8 解）。Windows 上 stdout 是管道时默认是 ANSI 代码页，
+    报告里一出现中文路径就 UnicodeEncodeError、退出码 1、零 JSON，调用方只能把它读成
+    「启动器起不来」（#559 的 Windows CI 撞到；与降级 server 的 reconfigure 同一做法）。"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
+def _utf8_stderr() -> None:
+    """诊断行（「引擎解释器 …，交棒」「没找到能 import tavotto.engine 的解释器 …」）一律按
+    UTF-8 写 stderr。Codex 按 UTF-8 读 MCP server 的 stderr：Windows 上管道默认是 ANSI 代码页
+    （中文系统是 GBK），第一行中文就让它记下「stream did not contain valid UTF-8」并**停读**
+    ——这正是降级时唯一会说人话的那一行，被丢得一字不剩（#266，真 Windows 11 + Codex Desktop
+    实测）。只动 stderr：stdout 归协议，由各自的路径设定。"""
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    _utf8_stderr()
+    if "--health" in argv or "--provision" in argv:
+        _utf8_stdio()
+    if "--health" in argv:
+        report, rc = health()
+        print(json.dumps(report, ensure_ascii=False))
+        return rc
+    if "--provision" in argv:
+        values = {}
+        for flag, what in (("--from", "wheel/源码目录/requirement"), ("--python", "解释器路径")):
+            values[flag] = None
+            if flag in argv:
+                at = argv.index(flag)
+                values[flag] = argv[at + 1] if at + 1 < len(argv) else None
+                if values[flag] is None:
+                    print(
+                        json.dumps(
+                            {"ok": False, "code": "bad_args", "error": f"{flag} 后面要跟{what}"},
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 2
+        # 改环境之前先拿内核锁：后台那次与手动 / `tavotto codex install` 跑的这次
+        # 同一时间只许一个动 venv（#548 评审 P2）；拿不到就不动，明确报出来。
+        try:
+            lock = _acquire_provision_lock()
+        except OSError as exc:
+            lock, busy = None, str(exc)
+        else:
+            busy = None if lock is not None else "running"
+        if lock is None:
+            report = {
+                "ok": False,
+                "code": "provision_in_progress" if busy == "running" else "provision_lock_failed",
+                "error": "另一次重装正在进行（后台自动修复或另一条 --provision），等它结束后再试"
+                if busy == "running"
+                else f"拿不到重装锁：{busy}",
+            }
+            print(json.dumps(report, ensure_ascii=False))
+            return 3
+        try:
+            report, rc = provision(values["--from"], python_base=values["--python"])
+        finally:
+            _release_provision_lock(lock)
+        print(json.dumps(report, ensure_ascii=False))
+        return rc
+
+    sys.path.insert(0, HERE)  # 让 `tavotto_mcp` 包可 import
+    if _current_engine_ok():
+        from tavotto_mcp.rpc import StdioConnection
+
+        StdioConnection.hijack_stdout()
+        from tavotto_mcp.server import main as run
+
+        return run(argv)
+
+    found = _plugin_locator().find_tavotto()
+    if os.environ.get(_EXECED_ENV) != "1":
+        t0 = time.monotonic()
+        resolution = resolve(found)
+        if resolution["python"]:
+            print(
+                f"tavotto-mcp: 引擎解释器 {resolution['python']}"
+                f"（{resolution['source']}，解析 "
+                f"{int((time.monotonic() - t0) * 1000)}ms），交棒。",
+                file=sys.stderr,
+            )
+            os.environ[_EXECED_ENV] = "1"
+            return _hand_off(resolution["python"], argv)
+    else:
+        resolution = {"python": None, "source": None, "tried": []}
+    diag = diagnosis_resolved(found, resolution)
+    code, hint = diag["code"], diag["hint"]
+    if diag.get("engine"):
+        resolution = {**resolution, "found_engine": diag["engine"]}
+    if "index" in diag:
+        resolution = {**resolution, "pip_index": diag["index"]}
+    if code == "managed_runtime_stale":
+        auto = kick_background_provision()
+        resolution = {**resolution, "auto_provision": auto}
+        if auto["started"] or auto["reason"] == "already_running":
+            hint = MANAGED_STALE_KICKED_HINT
+        elif auto["reason"] == "venv_in_use":
+            hint = (
+                "插件自管环境要整个重建（它的 Python 版本不在 "
+                + python_range_text()
+                + "），可本会话正跑在它里面的 python.exe 上，Windows 删不掉正在运行的文件。"
+                "请先装一个 Python " + python_range_text() + "，退出 Codex，在终端运行："
+                "py -3 <插件目录>/mcp/server.py --provision，然后重新打开 Codex。"
+            )
+        else:
+            hint = (
+                "插件自管环境里的引擎跟当前插件对不上（多半是插件升级后环境还是旧版），"
+                "后台自动重装没有启动（" + auto["reason"] + "）。请手动跑："
+                "python3 <插件目录>/mcp/server.py --provision，然后新开一次 Codex 会话。"
+            )
+    print(
+        f"tavotto-mcp: 没找到能 import tavotto.engine 的解释器（{code}），进入降级模式。" + hint,
+        file=sys.stderr,
+    )
+    return _degraded_server(code, hint, resolution)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

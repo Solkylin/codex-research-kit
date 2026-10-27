@@ -1,0 +1,7 @@
+interface:
+  display_name: "科研与工程交付"
+  short_description: "按需组织科研工程的资料、推导、计算、工具协作与成果交付"
+  default_prompt: "使用 $research-to-deliverable，依据当前任务和已有成果选择必要的研究、计算、实现、协作或文件制作方法，完成相称验证并交付可使用的结果。"
+policy:
+  allow_implicit_invocation: true
+

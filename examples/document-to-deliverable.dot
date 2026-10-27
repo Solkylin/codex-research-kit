@@ -1,0 +1,12 @@
+digraph documents {
+  graph [rankdir=LR, bgcolor="transparent", pad="0.2", nodesep="0.35", ranksep="0.5"];
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=11, color="#334155", fillcolor="#f8fafc", margin="0.14,0.08"];
+  edge [color="#64748b", penwidth=1.4, arrowsize=0.7];
+  input [label="PDF / 扫描 / 论文", fillcolor="#dbeafe"];
+  extract [label="PDF / Docling\n按需结构提取", fillcolor="#e0e7ff"];
+  source [label="原页回查\n图/表/公式/单位"];
+  story [label="证据到页面\n结论/机制/结果", fillcolor="#fef3c7"];
+  deck [label="可编辑 PPTX / PDF", fillcolor="#dcfce7"];
+  check [label="真实渲染检查", fillcolor="#bbf7d0"];
+  input -> extract -> source -> story -> deck -> check;
+}

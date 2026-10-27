@@ -1,0 +1,8 @@
+interface:
+  display_name: "技术演示"
+  short_description: "组织工程证据与互补图组，制作自然清楚、可编辑并经真实渲染检查的技术演示"
+  default_prompt: "使用 $technical-presentations，依据当前资料、读者和目标格式组织证据、图组与讲稿，按用户模板或默认技术版式制作可编辑演示并检查真实渲染。"
+
+policy:
+  allow_implicit_invocation: false
+

@@ -1,0 +1,24 @@
+digraph workflow {
+  graph [rankdir=LR, bgcolor="transparent", pad="0.2", nodesep="0.35", ranksep="0.5"];
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=11, color="#334155", fillcolor="#eff6ff", margin="0.14,0.08"];
+  edge [color="#64748b", penwidth=1.4, arrowsize=0.7];
+  request [label="任务\n输入/读者/完成标准", fillcolor="#dbeafe"];
+  main [label="research-to-deliverable\n共同流程与整合", fillcolor="#bfdbfe"];
+  route [label="技能路由\n按对象与格式选择", fillcolor="#e0e7ff"];
+  evidence [label="研究与证据\n检索/文献/批判性分析"];
+  model [label="数学与计算\n推导/实验/仿真"];
+  figures [label="出版级图表\nPython/MATLAB/R + Tavotto", fillcolor="#dcfce7"];
+  docs [label="正式交付\nLaTeX/Quarto/PDF/PPTX", fillcolor="#fef3c7"];
+  qa [label="关键检查\n数据/渲染/可编辑性"];
+  deliver [label="可使用成果\n源文件 + 成品 + 说明", fillcolor="#bbf7d0"];
+  request -> main -> route;
+  route -> evidence;
+  route -> model;
+  route -> figures;
+  route -> docs;
+  evidence -> qa;
+  model -> qa;
+  figures -> qa;
+  docs -> qa;
+  qa -> deliver;
+}

@@ -1,0 +1,27 @@
+{
+  "package": "codex-research-kit",
+  "version": "2026-10-27",
+  "license": "MIT",
+  "entrypoint": "skills/research-to-deliverable/SKILL.md",
+  "implicit_skill": "research-to-deliverable",
+  "explicit_support_skills": ["publication-figures", "docling", "technical-presentations"],
+  "optional_third_party": ["third_party/tavotto/codex-plugin"],
+  "included": [
+    "AGENTS.md",
+    "skills/research-to-deliverable",
+    "skills/publication-figures",
+    "skills/docling",
+    "skills/technical-presentations",
+    "docs",
+    "examples",
+    "third_party/tavotto/codex-plugin"
+  ],
+  "excluded": [
+    "company migration rules and internal workbench files",
+    "config.toml, model catalogs, auth, tokens, cookies and OAuth state",
+    "sessions, attachments, logs, caches, runtime databases and test outputs",
+    "proprietary host skills and connector caches",
+    "MATLAB installations and machine-specific MCP registrations",
+    "private research data and project outputs"
+  ]
+}
