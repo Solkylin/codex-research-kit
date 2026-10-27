@@ -9,7 +9,7 @@
     "docling",
     "technical-presentations"
   ],
-  "skill_count": 32,
+  "skill_count": 31,
   "included_skills": [
     "aeon",
     "citation-management",
@@ -21,7 +21,6 @@
     "markitdown",
     "matplotlib",
     "networkx",
-    "paper-lookup",
     "peer-review",
     "polars",
     "publication-figures",
